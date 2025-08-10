@@ -1,4 +1,4 @@
-# BWM Replication Project
+# *The Material Origins of Place-Based Affective Polarization in Canada* Replication Code
 
 This repository contains scripts and documentation for replicating the analyses and visualizations for Bradley Wood-MacLean's MA thesis titled "The Material Origins of Place-Based Affective Polarization in Canada." This thesis was authored solely by Bradley Wood-MacLean. 
 The workflow is organized into numbered scripts that should be run in sequence.
