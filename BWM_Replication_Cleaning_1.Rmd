@@ -1,0 +1,790 @@
+---
+title: "3_merging_data_clean"
+author: "Brad Wood-MacLean"
+date: "2025-05-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "/Users/bradleywood-maclean/Desktop/MA Thesis/MA_Thesis/")
+library(tidyverse)
+library(readr)
+library(sf)
+library(dplyr)
+library(stringr)
+library(knitr)
+library(tibble)
+library(scales)
+library(rio)
+library(purrr)
+library(forcats)
+library(tidytext)
+library(stopwords)
+library(textdata)
+library(Matrix)
+library(widyr)
+library(stm)
+library(furrr)
+library(BTM)
+library(tokenizers)
+library(broom)
+```
+
+```{r}
+# Part 1 Cleaning and Preparing Survey Data for Merging
+
+# 1. Load the data
+dat <- rio::import("/Users/bradleywood-maclean/Desktop/MA Thesis/MA_Thesis/ccpd_survey_data/ccpd_survey.dta")
+
+# 2. Re-create unified experimental variables from original experiment
+dat <- dat %>%
+  mutate(
+    exp_policy = case_when(
+      !is.na(jcu_placeid) | !is.na(jcr_placeid) |
+      !is.na(jlu_placeid) | !is.na(jlr_placeid) ~ "anti_enviro",
+      !is.na(ccu_placeid) | !is.na(ccr_placeid) |
+      !is.na(clu_placeid) | !is.na(clr_placeid) ~ "pro_enviro",
+      TRUE ~ NA_character_
+    ),
+    exp_party = case_when(
+      !is.na(jlu_placeid) | !is.na(jlr_placeid) |
+      !is.na(clu_placeid) | !is.na(clr_placeid) ~ "Liberal",
+      !is.na(jcu_placeid) | !is.na(jcr_placeid) |
+      !is.na(ccu_placeid) | !is.na(ccr_placeid) ~ "Conservative",
+      TRUE ~ NA_character_
+    ),
+    exp_ur = case_when(
+      !is.na(jcu_placeid) | !is.na(jlu_placeid) |
+      !is.na(ccu_placeid) | !is.na(clu_placeid) ~ "urban",
+      !is.na(jcr_placeid) | !is.na(ccr_placeid) |
+      !is.na(jlr_placeid) | !is.na(clr_placeid) ~ "rural",
+      TRUE ~ NA_character_
+    ),
+    exp_score_placeid = coalesce(
+      jcu_placeid, jcr_placeid,
+      jlu_placeid, jlr_placeid,
+      ccu_placeid, ccr_placeid,
+      clu_placeid, clr_placeid
+    ),
+    exp_score_partyid = coalesce(
+      jcu_partyid, jcr_partyid,
+      jlu_partyid, jlr_partyid,
+      ccu_partyid, ccr_partyid,
+      clu_partyid, clr_partyid
+    ),
+    exp_score_trust = coalesce(
+      jcu_trust, jcr_trust,
+      jlu_trust, jlr_trust,
+      ccu_trust, ccr_trust,
+      clu_trust, clr_trust
+    ),
+    exp_score_like = coalesce(
+      jcu_like, jcr_like,
+      jlu_like, jlr_like,
+      ccu_like, ccr_like,
+      clu_like, clr_like
+    ),
+    treatment_group = case_when(
+      !is.na(jcu_trust) ~ "jcu",
+      !is.na(jcr_trust) ~ "jcr",
+      !is.na(jlu_trust) ~ "jlu",
+      !is.na(jlr_trust) ~ "jlr",
+      !is.na(ccu_trust) ~ "ccu",
+      !is.na(ccr_trust) ~ "ccr",
+      !is.na(clu_trust) ~ "clu",
+      !is.na(clr_trust) ~ "clr",
+      TRUE             ~ NA_character_
+    )
+  )
+
+# 3. Construct DV: place-based affective polarization for everyone
+dat <- dat %>%
+  mutate(
+    place_ap = case_when(
+      placetype_best == 3 ~ therm1_3 - therm1_1,  # rural minus urban
+      placetype_best == 1 ~ therm1_1 - therm1_3,  # urban minus rural
+      TRUE               ~ NA_real_               # suburban (or other) → NA
+    )
+  )
+
+# 4. Construct IVs: clean resentment items and build constructs
+
+dat <- dat %>%
+  # 4a. Turn any 9s into NA across all resentment items
+  mutate(across(starts_with("resent"), ~ na_if(., 9))) %>%
+
+  # 4b. Create rural_resentment only for rural respondents (placetype_best == 3)
+  mutate(
+    rural_resentment = if_else(
+      placetype_best == 3,
+      rowMeans(
+        cbind(
+          rescale(resent4_ru,  to = c(0,1), na.rm = TRUE),  # political
+          rescale(resent2_ru,  to = c(0,1), na.rm = TRUE),  # economic
+          rescale(resent3_ru,  to = c(0,1), na.rm = TRUE)   # cultural
+        ),
+        na.rm = TRUE
+      ),
+      NA_real_
+    )
+  ) %>%
+
+  # 4c. Create urban_resentment only for urban respondents (placetype_best == 1)
+  mutate(
+    urban_resentment = if_else(
+      placetype_best == 1,
+      rowMeans(
+        cbind(
+          rescale(resent4_ur,  to = c(0,1), na.rm = TRUE),  # political
+          rescale(resent2_ur,  to = c(0,1), na.rm = TRUE),  # economic
+          rescale(resent1_ur,  to = c(0,1), na.rm = TRUE)   # cultural
+        ),
+        na.rm = TRUE
+      ),
+      NA_real_
+    )
+  )
+
+# 5. Cleaning control variables on the full dataset
+clean_controls <- function(df) {
+  df %>%
+    # 1. ideology: turn 99 into NA
+    mutate(ideology = na_if(ideology, 99)) %>%
+
+    # 2. partisanship factor with labels
+    mutate(
+      partisanship = case_when(
+        partisanship == 1  ~ "Bloc Québécois",
+        partisanship == 2  ~ "Conservative",
+        partisanship == 3  ~ "Green",
+        partisanship == 4  ~ "Liberal",
+        partisanship == 5  ~ "NDP",
+        partisanship == 6  ~ "Other",
+        partisanship == 7  ~ "None",
+        partisanship == 10 ~ "PPC",
+        partisanship == 9  ~ NA_character_,  # prefer‐not‐to‐answer  NA
+        TRUE               ~ NA_character_
+      ),
+      partisanship = factor(partisanship)
+    ) %>%
+
+    # 3. gender factor with “Woman” as the reference
+    mutate(
+      gender = case_when(
+        gender == 1 ~ "Man",
+        gender == 2 ~ "Woman",
+        gender == 4 ~ "Other",
+        gender == 5 ~ NA_character_,    # P NA
+        TRUE        ~ NA_character_
+      ),
+      gender = factor(gender, levels = c("Woman","Man","Other"))
+    ) %>%
+    mutate(gender = relevel(gender, ref = "Woman")) %>%
+
+    # 4. education 4‐level factor
+    mutate(
+      education = case_when(
+        education %in% c(1,2)       ~ "High school or less",
+        education == 3              ~ "Some postsecondary",
+        education == 4              ~ "College diploma",
+        education %in% c(5,6,7)     ~ "University degree",
+        education == 9              ~ NA_character_,
+        TRUE                        ~ NA_character_
+      ),
+      education = factor(
+        education,
+        levels = c(
+          "High school or less",
+          "Some postsecondary",
+          "College diploma",
+          "University degree"
+        )
+      )
+    )
+}
+dat <- clean_controls(dat)
+
+# 6. Construct partisan affective polarization on the full dataset
+make_partisan_polar <- function(df) {
+  df %>%
+    mutate(
+      # pick out each partisan’s “in‐group” and “out‐group” warmth
+      ingroup_therm = case_when(
+        partisanship == "Liberal"     ~ therm2_1,  # rating for Liberals
+        partisanship == "Conservative"~ therm2_2,  # rating for Conservatives
+        TRUE                           ~ NA_real_
+      ),
+      outgroup_therm = case_when(
+        partisanship == "Liberal"     ~ therm2_2,
+        partisanship == "Conservative"~ therm2_1,
+        TRUE                           ~ NA_real_
+      ),
+      # compute the difference
+      partisan_affective_polarization = ingroup_therm - outgroup_therm
+    ) %>%
+    # drop the temporary cols
+    select(-ingroup_therm, -outgroup_therm)
+}
+dat <- make_partisan_polar(dat)
+
+```
+
+
+```{r}
+# Geographic Variables
+# The Postal Code Conversion File
+col_widths <- c(
+  6,   # postal_code
+  3,   # FSA
+  2,   # PR
+  4,   # CDuid
+  7,   # CSDuid
+  70,  # CSDname
+  3,   # CSDtype
+  3,   # CCScode
+  3,   # SAC
+  1,   # SACtype
+  7,   # CTname
+  2,   # ER
+  4,   # DPL
+  5,   # FED13uid
+  4,   # POP_CNTR_RA
+  1,   # POP_CNTR_RA_type
+  8,   # DAuid
+  3,   # Dissemination_block
+  1,   # Rep_Pt_Type
+  11,  # LAT
+  13,  # LONG
+  1,   # SLI
+  1,   # PCtype
+  30,  # Comm_Name
+  1,   # DMT
+  1,   # H_DMT
+  8,   # Birth_Date
+  8,   # Ret_Date
+  1,   # PO
+  3,   # QI
+  1,   # Source
+  1    # POP_CNTR_RA_SIZE_CLASS
+)
+
+# Define column names based on PCCF Reference Guide
+col_names <- c(
+  "postal_code",
+  "FSA",
+  "PR",
+  "CDuid",
+  "CSDuid",
+  "CSDname",
+  "CSDtype",
+  "CCScode",
+  "SAC",
+  "SACtype",
+  "CTname",
+  "ER",
+  "DPL",
+  "FED13uid",
+  "POP_CNTR_RA",
+  "POP_CNTR_RA_type",
+  "DAuid",
+  "Dissemination_block",
+  "Rep_Pt_Type",
+  "LAT",
+  "LONG",
+  "SLI",
+  "PCtype",
+  "Comm_Name",
+  "DMT",
+  "H_DMT",
+  "Birth_Date",
+  "Ret_Date",
+  "PO",
+  "QI",
+  "Source",
+  "POP_CNTR_RA_SIZE_CLASS"
+)
+
+# Load the full PCCF
+pccf_full <- read_fwf(
+  file = "/Users/bradleywood-maclean/Desktop/MA Thesis/MA_Thesis/PCCF/Data/PCCF_FCCP_V2503_2021.txt",
+  fwf_widths(col_widths, col_names),
+  locale = locale(encoding = "latin1")
+)
+
+```
+
+```{r}
+# Collapse PCCF to one row per postal code (ensure we don't make extra rows in the merge)
+pccf_unique <- pccf_full %>%
+  group_by(postal_code) %>%
+  slice(1) %>%   
+  ungroup()
+
+# Merge by postal code, each ccpd respondent will get pccf contextual information based on postal code
+dat_geo <- dat %>%
+  mutate(postalcode = str_to_upper(str_replace_all(postalcode, "\\s+", ""))) %>%
+  left_join(
+    pccf_unique %>%
+      mutate(postal_code = str_to_upper(str_replace_all(postal_code, "\\s+", ""))),
+    by = c("postalcode" = "postal_code")
+  )
+
+```
+
+```{r}
+# Drop respondents missing PCCF geography
+dat_geo <- dat_geo %>%
+  filter(!is.na(CSDuid))
+```
+
+```{r}
+# INDEX OF REMOTENESS 
+# Load and clean the remoteness index data
+remoteness_path <- "/Users/bradleywood-maclean/Desktop/MA Thesis/MA_Thesis/Index of Remoteness/2021IR_DATABASE.csv"
+
+remoteness_data <- read_csv(remoteness_path) %>%
+  select(
+    CSDuid = CSDuid,                  # keep name consistent with dat_geo
+    CSDname = CSDname,
+    Pruid = Pruid,
+    pop_2021 = CSDpop2021,
+    remoteness_index = Index_of_remoteness
+  )
+
+# Merge into the cleaned survey + PCCF data
+dat_geo <- dat_geo %>%
+  left_join(remoteness_data, by = "CSDuid")
+
+```
+
+```{r}
+# Convert to sf 
+dat_geo_sf <- st_as_sf(dat_geo, coords = c("LONG", "LAT"), crs = 4326) %>%
+  st_transform(3347) #re-project to StatsCan optimized mapping system (3347) from the standard GPS coordinates (4326)
+```
+
+```{r}
+# HOSPITALS
+# Load hospital data
+odhf <- rio::import("/Users/bradleywood-maclean/Desktop/MA Thesis/MA_Thesis/hospital data/odhf_bdoes_v1.csv")
+
+# Filter and clean: select hospitals only, remove bad or missing lat/lon
+odhf_hospitals <- odhf %>%
+  filter(odhf_facility_type == "Hospitals") %>%
+  filter(!is.na(latitude), !is.na(longitude)) %>%
+  select(
+    facility_name,
+    odhf_facility_type,
+    postal_code,
+    CSDname,
+    CSDuid,
+    province,
+    latitude,
+    longitude
+  ) %>%
+  # Convert to sf in lat/lon (WGS 84)
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>%
+  # Remove outliers: keep only valid Canada bounding box, this removes 8 mistakes
+  filter(
+    st_coordinates(.)[, 2] >= 35,  # lat between 35°N and 70°N
+    st_coordinates(.)[, 2] <= 70,
+    st_coordinates(.)[, 1] >= -140, # lon between 140°W and 50°W
+    st_coordinates(.)[, 1] <= -50
+  ) %>%
+  # Reproject to match the CRS of survey data
+  st_transform(crs = st_crs(dat_geo_sf))
+
+# Compute nearest hospital row index for each respondent (in meters, projecting from EPSG:3347)
+nearest_hospital_idx <- st_nearest_feature(dat_geo_sf, odhf_hospitals)
+
+# Safely extract nearest hospital info
+nearest_hospitals <- odhf_hospitals[nearest_hospital_idx, ]
+
+# Add hospital info + distance to each respondent
+dat_geo_sf <- dat_geo_sf %>%
+  mutate(
+    nearest_hosp_name = nearest_hospitals$facility_name, # name of nearest hospitals
+    nearest_hosp_type = nearest_hospitals$odhf_facility_type, # this will just be "Hospital" for everything
+    distance_to_hosp_m = as.numeric(st_distance(geometry, nearest_hospitals$geometry, by_element = TRUE)) # distance in m (see above)
+  )
+
+```
+
+```{r}
+# Create a list of LINESTRING geometries
+line_geoms <- map2(dat_geo_sf$geometry, nearest_hospitals$geometry, ~ 
+  st_cast(st_union(.x, .y), "LINESTRING")
+)
+
+# Combine into a single object
+lines_sfc <- st_sfc(line_geoms, crs = st_crs(dat_geo_sf))
+
+# Turn into an sf object 
+lines_sf <- st_as_sf(
+  data.frame(
+    distance_m = dat_geo_sf$distance_to_hosp_m
+  ),
+  geometry = lines_sfc
+)
+
+dat_geo_sf <- dat_geo_sf %>%
+  mutate(place_type_label = case_when(
+    placetype_best == 1 ~ "Urban",
+    placetype_best == 2 ~ "Suburban",
+    placetype_best == 3 ~ "Rural",
+    TRUE                ~ NA_character_  # drop missing
+  ))
+
+dat_geo_sf %>%
+  filter(!is.na(placetype_best)) %>%
+  mutate(place_type_label = case_when(
+    placetype_best == 1 ~ "Urban",
+    placetype_best == 2 ~ "Suburban",
+    placetype_best == 3 ~ "Rural"
+  )) %>%
+  group_by(place_type_label) %>%
+  summarise(
+    avg_distance_km = mean(distance_to_hosp_m, na.rm = TRUE) / 1000,
+    median_distance_km = median(distance_to_hosp_m, na.rm = TRUE) / 1000,
+    n = n()
+  )
+```
+
+
+```{r}
+# BRIDGES
+# Load full infrastructure layer (bridges + tunnels)
+infra_path <- "/Users/bradleywood-maclean/Desktop/MA Thesis/MA_Thesis/Bridges and Tunnels Data/odi_bridges_tunnels.gpkg"
+bridges <- st_read(infra_path)
+
+# Clean and filter: keep only valid bridges within Canada's rough lat/lon
+bridges_clean <- bridges %>%
+  filter(str_detect(tolower(sub_type), "bridge")) %>%       # Only structures labeled as bridges
+  filter(!is.na(csdname)) %>%
+  select(
+    structure_type = sub_type,
+    csdname,
+    province = prov_terr
+  ) %>%
+  st_centroid(of_largest_polygon = TRUE) %>%                # Ensure we get POINTs
+  st_transform(4326) %>%                                    # Transform to WGS84 to filter by lat/lon
+  mutate(
+    lon = st_coordinates(.)[, 1],
+    lat = st_coordinates(.)[, 2]
+  ) %>%
+  filter(
+    lat >= 40, lat <= 70,                                    # Filter out invalid geometries
+    lon >= -140, lon <= -50
+  ) %>%
+  select(-lat, -lon) %>%
+  st_transform(st_crs(dat_geo_sf))                          # Reproject to match respondent CRS
+
+# Compute nearest bridge to each respondent
+nearest_bridge_idx <- st_nearest_feature(dat_geo_sf, bridges_clean)
+
+# Extract matched bridges for each respondent
+nearest_bridges <- bridges_clean[nearest_bridge_idx, ]
+
+# Add bridge info + distance to each respondent
+dat_geo_sf <- dat_geo_sf %>%
+  mutate(
+    nearest_structure_type = nearest_bridges$structure_type,
+    nearest_structure_csd  = nearest_bridges$csdname,
+    nearest_structure_prov = nearest_bridges$province,
+    distance_to_bridge_m = as.numeric(
+      st_distance(
+        geometry,
+        st_geometry(nearest_bridges),
+        by_element = TRUE
+      )
+    )
+  )
+
+# Force all geometries to POINTs using centroids
+bridges_clean <- bridges_clean %>%
+  st_centroid(of_largest_polygon = TRUE)  # in case of MULTIPOLYGON/LINESTRING
+
+dat_geo_sf <- dat_geo_sf %>%
+  mutate(place_type_label = case_when(
+    placetype_best == 1 ~ "Urban",
+    placetype_best == 2 ~ "Suburban",
+    placetype_best == 3 ~ "Rural",
+    TRUE ~ NA_character_
+  ))
+
+dat_geo_sf %>%
+  filter(!is.na(placetype_best)) %>%
+  mutate(place_type_label = case_when(
+    placetype_best == 1 ~ "Urban",
+    placetype_best == 2 ~ "Suburban",
+    placetype_best == 3 ~ "Rural"
+  )) %>%
+  group_by(place_type_label) %>%
+  summarise(
+    avg_distance_km = mean(distance_to_bridge_m, na.rm = TRUE) / 1000,
+    median_distance_km = median(distance_to_bridge_m, na.rm = TRUE) / 1000,
+    n = n()
+  )
+```
+
+```{r}
+# CENSUS
+#  Load and rename census data
+census21 <- import("/Users/bradleywood-maclean/Desktop/MA Thesis/MA_Thesis/2021_census_selections/2021_census_selections.csv") %>%
+  rename(
+    ada_code                  = COL0,
+    ada_name                  = COL1,
+    population                = COL2,
+    total_income              = COL3,
+    income_bracket_total      = COL4,
+    income_bracket_after_tax  = COL5,
+    income_bracket_employment = COL6,
+    housing_tenure            = COL7,
+    education_level           = COL8,
+    unemployment_rate         = COL9,
+    commuting_destination     = COL10,
+    mobility_1yr              = COL11,
+    mobility_5yr              = COL12
+  ) %>%
+  mutate(
+    ada_code = as.character(ada_code),
+    education_level = (education_level / population) * 100, # these variables are initially raw counts, making them percents
+    housing_tenure  = (housing_tenure  / population) * 100,
+    mobility_1yr    = (mobility_1yr    / population) * 100,
+    mobility_5yr    = (mobility_5yr    / population) * 100
+  )
+
+# Load postal code -> ADA matcher and clean
+matcher <- import("postal code - ADA matcher file.csv") %>%
+  rename(postalcode = PC, ada_code = ADAuid) %>%
+  mutate(
+    postalcode = str_remove_all(postalcode, " "),
+    ada_code = as.character(ada_code)
+  )
+
+# Standardize postalcode in respondent dataset
+dat_geo_sf <- dat_geo_sf %>%
+  mutate(postalcode = str_remove_all(postalcode, " "))
+
+# Join respondents to ADA codes via postal code
+dat_with_ada <- dat_geo_sf %>%
+  left_join(matcher, by = "postalcode")
+
+# Join ADA-level census data
+ccpd_final <- dat_with_ada %>%
+  left_join(census21, by = "ada_code")
+
+
+unmatched_postals <- c("X0A2H0", "V3K0J3", "R2V5E9", "R3Y2J3",
+                       "E2L0G5", "V1V0G9", "V1T0E2", "T3S0E8")
+matcher %>%
+  filter(postalcode %in% unmatched_postals)
+```
+
+```{r}
+# BROADBAND 
+#Load and clean broadband metrics
+data_path <- "/Users/bradleywood-maclean/Desktop/MA Thesis/MA_Thesis/Broadband Internet Data/"
+
+hex_data <- read_csv(file.path(data_path, "Data_Hex_Donn‚es.csv"), show_col_types = FALSE) %>%
+  mutate(
+    HEXuid_HEXidu = as.character(HEXuid_HEXidu),
+    underserved = if_else(Avail_50_10_Gradient_Dispo == 0, 1L, 0L)
+  )
+
+# 1b. UBF investment data
+ubf_core <- read_csv(file.path(data_path, "UBF_Core_Hex_FLBU_Principal.csv"), show_col_types = FALSE) %>%
+  mutate(HEXuid_HEXidu = as.character(HEXuid_HEXidu))
+ubf_vrr <- read_csv(file.path(data_path, "UBF_RRS_Hex_FLBU_VRR.csv"), show_col_types = FALSE) %>%
+  mutate(HEXuid_HEXidu = as.character(HEXuid_HEXidu))
+
+ubf_hexes <- bind_rows(ubf_core, ubf_vrr) %>%
+  distinct(HEXuid_HEXidu) %>%
+  mutate(has_ubf_investment = 1L)
+
+# 1c. Provincial investment data
+prov_terr <- read_csv(file.path(data_path, "ProvTerr_Proj_ProvTerr.csv"), show_col_types = FALSE) %>%
+  mutate(HEXuid_HEXidu = as.character(HEXuid_HEXidu)) %>%
+  distinct(HEXuid_HEXidu) %>%
+  mutate(has_prov_investment = 1L)
+
+# 1d. Merge into broadband data
+hex_data <- hex_data %>%
+  left_join(ubf_hexes, by = "HEXuid_HEXidu") %>%
+  left_join(prov_terr, by = "HEXuid_HEXidu") %>%
+  mutate(
+    has_ubf_investment  = replace_na(has_ubf_investment,  0L),
+    has_prov_investment = replace_na(has_prov_investment, 0L)
+  )
+
+# load project hex grid as sf
+hex_path <- "/Users/bradleywood-maclean/Desktop/MA Thesis/MA_Thesis/hexagonal_grids/CHX_EXO.csv"
+
+hex_grid <- read_csv(hex_path, show_col_types = FALSE) %>%
+  rename(
+    HEXuid_HEXidu = HEXuid_HEXidu,
+    lon = Longitude,
+    lat = Latitude
+  ) %>%
+  filter(!is.na(lon), !is.na(lat)) %>%
+  st_as_sf(coords = c("lon", "lat"), crs = 4326) %>%
+  st_transform(crs = st_crs(ccpd_final))  # match CRS of survey data
+
+# merge broadband metrics into hex grid
+hex_data_full <- hex_grid %>%
+  left_join(hex_data, by = "HEXuid_HEXidu")
+
+# match each respondent to the nearest broadband hex
+nearest_hex <- st_nearest_feature(ccpd_final, hex_data_full)
+
+ccpd_with_broadband <- ccpd_final %>%
+  mutate(
+    nearest_hex_id      = hex_data_full$HEXuid_HEXidu[nearest_hex],
+    underserved         = hex_data_full$underserved[nearest_hex],
+    has_ubf_investment  = hex_data_full$has_ubf_investment[nearest_hex],
+    has_prov_investment = hex_data_full$has_prov_investment[nearest_hex]
+  )
+
+ccpd_with_broadband <- ccpd_with_broadband %>%
+  mutate(place_type_label = case_when(
+    placetype_best == 1 ~ "Urban",
+    placetype_best == 2 ~ "Suburban",
+    placetype_best == 3 ~ "Rural",
+    TRUE ~ NA_character_
+  ))
+
+# Group by place type and broadband variables
+broadband_summary <- ccpd_with_broadband %>%
+  filter(!is.na(place_type_label)) %>%
+  group_by(place_type_label) %>%
+  summarise(
+    total_respondents = n(),
+    underserved_n = sum(underserved == 1, na.rm = TRUE),
+    ubf_investment_n = sum(has_ubf_investment == 1, na.rm = TRUE),
+    prov_investment_n = sum(has_prov_investment == 1, na.rm = TRUE)
+  )
+
+```
+
+```{r}
+# UNIVERSITIES 
+
+# 1. Load ODEF data (contains all educational facilities)
+odef_path <- "/Users/bradleywood-maclean/Desktop/MA Thesis/MA_Thesis/ODEF_v3.0/odef_v3.csv"
+
+odef <- read_csv(odef_path, show_col_types = FALSE)
+
+# 2. Filter to universities only
+# Filter and convert to sf
+universities <- odef %>%
+  filter(ISCED4Plus == 1) %>%  # Postsecondary only
+  filter(!is.na(geometry)) %>%
+  filter(str_detect(tolower(facility_name), "university|université")) %>% # ISCED4 classification is binary, so it groups all-post secondary institutions together, so to get around this I filter to keep the word "university"
+  st_as_sf(wkt = "geometry", crs = 4326) %>%
+  st_transform(crs = st_crs(dat_geo_sf))
+
+
+universities %>% select(facility_name, province_code) %>% arrange(facility_name)
+
+dat_geo_sf <- ccpd_with_broadband
+# Find index of nearest university for each respondent
+nearest_university_idx <- st_nearest_feature(dat_geo_sf, universities)
+
+# Extract university data
+nearest_universities <- universities[nearest_university_idx, ]
+
+# Add university info and distance to respondents
+dat_geo_sf <- dat_geo_sf %>%
+  mutate(
+    nearest_university_name = nearest_universities$facility_name,
+    distance_to_university_m = as.numeric(
+      st_distance(geometry, nearest_universities$geometry, by_element = TRUE)
+    )
+  )
+
+dat_geo_sf %>%
+  select(postalcode, nearest_university_name, distance_to_university_m) %>%
+  head(10)
+
+summary(dat_geo_sf$distance_to_university_m)
+```
+
+
+```{r}
+# university density variable = number of unis within a 100km radius
+# Step 1: Create 100 km buffer around each respondent
+respondent_buffers <- st_buffer(dat_geo_sf, dist = 100000)
+
+# Step 2: Count number of universities within each buffer
+# This returns a list of indices; we count the lengths
+university_counts <- st_intersects(respondent_buffers, universities)
+
+# Step 3: Add result to respondent dataset
+dat_geo_sf <- dat_geo_sf %>%
+  mutate(university_density_100km = lengths(university_counts))
+
+summary(dat_geo_sf$university_density_100km)
+
+```
+
+
+## Google Maps Data
+
+**Switch to google maps document to see the code that generates the google maps data**
+
+```{r}
+# load the google maps data from document 4
+g_maps <- rio::import("cultural_scores_output.csv")
+
+# get rid of the extra columns
+g_maps_filtered <- g_maps %>%
+  select(response_id, cultural_score)
+
+# merge in
+dat_geo_sf <- dat_geo_sf %>%
+  left_join(g_maps_filtered, by = "response_id")
+
+
+dat_geo_sf %>%
+  filter(!is.na(placetype_best)) %>%
+  group_by(placetype_best) %>%
+  summarize(
+    mean_score = mean(cultural_score, na.rm = TRUE),
+    median_score = median(cultural_score, na.rm = TRUE),
+    n = n()
+  )
+
+dat_geo_sf <- dat_geo_sf %>%
+  mutate(
+    placetype_best = case_when(
+      placetype_best == 1 ~ "Urban",
+      placetype_best == 2 ~ "Suburban",
+      placetype_best == 3 ~ "Rural",
+      TRUE ~ NA_character_
+    )
+  )
+
+dat_geo_sf <- dat_geo_sf %>%
+  mutate(
+    radius_m = case_when(
+      placetype_best == "Urban" ~ 1000,
+      placetype_best == "Suburban" ~ 3000,
+      placetype_best == "Rural" ~ 7000,
+      TRUE ~ NA_real_
+    ),
+    search_area_km2 = pi * (radius_m / 1000)^2,
+    cultural_score_density = cultural_score / search_area_km2
+  )
+
+dat_geo_sf %>%
+  group_by(placetype_best) %>%
+  summarize(
+    mean_density = mean(cultural_score_density, na.rm = TRUE),
+    median_density = median(cultural_score_density, na.rm = TRUE),
+    n = n()
+  )
+
+```
+

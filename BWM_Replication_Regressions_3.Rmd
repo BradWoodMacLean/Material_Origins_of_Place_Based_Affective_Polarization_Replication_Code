@@ -1,0 +1,2917 @@
+---
+title: "10_yet_more_regressions"
+author: "Brad Wood-MacLean"
+output: hmtl_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "/Users/bradleywood-maclean/Desktop/MA Thesis/MA_Thesis/")
+library(tidyverse)
+library(readr)
+library(sf)
+library(dplyr)
+library(stringr)
+library(knitr)
+library(tibble)
+library(scales)
+library(rio)
+library(purrr)
+library(forcats)
+library(widyr)
+library(tidyr)
+library(fixest)
+library(caret)
+library(broom)
+library(marginaleffects)
+library(lme4)
+library(MuMIn)
+library(lmerTest)
+library(modelsummary)
+library(marginaleffects)
+library(ggplot2)
+library(patchwork)
+library(psych)
+```
+
+```{r, echo=F}
+# Code from b4
+# Load the cleaned data from document #3
+dat <- readRDS("dat3.rds")
+
+# make an unified resentment variable for those who were asked it
+dat <- dat %>%
+  mutate(
+    unified_resentment = coalesce(rural_resentment, urban_resentment)
+  )
+
+# Make multiparty_ap variable (handles more than just Liberals, Tories, and NDP)
+dat <- dat %>%
+  # ensure partisanship is character
+  mutate(ps = as.character(partisanship)) %>%
+  
+  # 1. grab in-group feeling
+  mutate(ingroup_feel = case_when(
+    ps == "Liberal"         ~ therm2_1,
+    ps == "Conservative"    ~ therm2_2,
+    ps == "NDP"             ~ therm2_3,
+    ps == "Green"           ~ therm2_4,
+    ps == "Bloc Québécois"  ~ therm2_5,
+    TRUE                    ~ NA_real_
+  )) %>%
+  
+  # 2. compute coldest out-group (blanking the in-group)
+  mutate(min_outgroup = pmin(
+    if_else(ps != "Liberal",      therm2_1, NA_real_),
+    if_else(ps != "Conservative", therm2_2, NA_real_),
+    if_else(ps != "NDP",          therm2_3, NA_real_),
+    if_else(ps != "Green",        therm2_4, NA_real_),
+    if_else(ps != "Bloc Québécois", therm2_5, NA_real_),
+    na.rm = TRUE
+  )) %>%
+  
+  # 3. difference = multiparty affective polarization
+  mutate(multiparty_ap = ingroup_feel - min_outgroup) %>%
+  
+  # clean up
+  select(-ps)
+
+# Age
+dat <- dat %>%
+  mutate(
+    agecat = factor(
+      agecat,
+      levels = 1:5,
+      labels = c(
+        "Under 18",
+        "18-29",
+        "30-44",
+        "45-59",
+        "60 or older"
+      )
+    )
+  )
+
+# region
+dat <- dat %>%
+  mutate(
+    region = case_when(
+      province %in% c(6, 8, 13)              ~ "North",     # NWT (6), Nunavut (8), Yukon!!!! (13)
+      province == 2                          ~ "BC",        # British Columbia (2)
+      province %in% c(1, 3, 12)              ~ "Prairies",  # Alberta (1), Manitoba (3), Saskatchewan (12)
+      province == 9                          ~ "ON",        # Ontario (9)
+      province == 11                         ~ "QC",        # Quebec (11)
+      province %in% c(4, 5, 7, 10)           ~ "Atl",       # NB(4), NL(5), NS(7), PEI(10)
+      TRUE                                   ~ NA_character_
+    ),
+    # ordered factor
+    region = factor(
+      region,
+      levels = c( "ON", "North", "BC", "Prairies", "QC", "Atl")
+    )
+  )
+
+# Two stable datasets
+# The Urban-Rural respondent dataset with only those who received the resentment battery I want 
+
+# remove suburban people
+dat_ur_ru <- dat %>% 
+  sf::st_drop_geometry() %>% 
+  filter(placetype_best != "Suburban")
+
+# remove those that did not get the resentment battery I want
+dat_ur_ru <- dat_ur_ru %>% 
+  filter(!is.na(unified_resentment))
+
+dat_ur_ru <- dat_ur_ru %>%
+  drop_na(partisanship, ideology, agecat, education, multiparty_ap, place_ap, gender, economic_index, political_index, cultural_index)
+
+# The dataset with everyone!
+dat_whole_gang <- dat %>% 
+  filter(!is.na(placetype_best))
+
+dat_whole_gang <- dat_whole_gang %>%
+  drop_na(partisanship, ideology, agecat, education, multiparty_ap)
+
+# Cleaning placeid questions
+# placeid1_urban How important is being an urban person to you?
+# placeid1_rural How important is being a rural person to you?
+dat_ur_ru <- dat_ur_ru %>%
+  mutate(
+    placeid1_urban = na_if(placeid1_urban, 9),
+    placeid1_rural = na_if(placeid1_rural, 9),
+    placeid       = coalesce(placeid1_urban, placeid1_rural)
+  ) %>%
+  drop_na(placeid)
+
+# first i need to correct the three indices so higher numbers all mean bad things
+# the political index is fine as is
+# the economic index needs to re-coded
+dat_ur_ru <- dat_ur_ru%>%
+  mutate(
+    income_log_z         = as.numeric(scale(income_log)),
+    unemployment_rate_z  = as.numeric(scale(unemployment_rate)),
+    
+    # Reverse income so that high = worse conditions
+    economic_index = rowMeans(cbind(
+      -income_log_z,          # reverse-coded income
+      unemployment_rate_z     # already "bad" when high
+    ), na.rm = TRUE)
+  )
+# the cultural index just needs to be reverse coded
+dat_ur_ru <- dat_ur_ru%>%
+  mutate(
+    university_density_100km_z = as.numeric(scale(university_density_100km)),
+    cultural_score_z           = as.numeric(scale(cultural_score_density)),
+
+    # Reverse both so that higher values = *less* cultural amenities = *more* neglect
+    cultural_index = rowMeans(cbind(
+      -university_density_100km_z,
+      -cultural_score_z
+    ), na.rm = TRUE)
+  )
+```
+
+
+
+# Model 1: Objective Measures -> Place-Based Affective Polarization
+
+```{r, echo=F, include=FALSE}
+model_1 <- lmer(place_ap ~ economic_index + political_index + cultural_index +  
+                  placetype_best + ideology + multiparty_ap + placeid + partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_ur_ru)
+
+summary(model_1)
+```
+
+# Model 2: Objective Measures -> Place-Based Affective Polarization (Without Vairables of Interest )
+
+```{r, echo=F, include=FALSE}
+model_2 <- lmer(place_ap ~ economic_index + political_index + cultural_index +  
+                   partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_ur_ru)
+
+summary(model_2)
+```
+
+
+# Model 3: Economic Index x Ideology
+
+```{r, echo=F, include=FALSE}
+model_3 <- lmer(place_ap ~ economic_index*ideology + political_index + cultural_index +  
+                  placetype_best + partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_ur_ru)
+
+summary(model_3)
+```
+
+# Model 4: Political Index X Ideology 
+
+```{r, echo=F, include=FALSE}
+model_4 <- lmer(place_ap ~ economic_index + political_index*ideology + cultural_index +  
+                  placetype_best + partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_ur_ru)
+
+summary(model_4)
+```
+
+# Model 5: Cultural Index X Ideology
+
+```{r, echo=F, include=FALSE}
+model_5 <- lmer(place_ap ~ economic_index + political_index + cultural_index*ideology +  
+                  placetype_best + partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_ur_ru)
+
+summary(model_5)
+```
+
+# Model 6: All Ideology Interactions
+
+```{r, echo=F, include=FALSE}
+model_6 <- lmer(place_ap ~ economic_index*ideology + political_index*ideology + cultural_index*ideology +  
+                  placetype_best + partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_ur_ru)
+
+summary(model_6)
+```
+
+# Model 7: Economic Index X Partisan Affective Polarization
+
+```{r, echo=F, include=FALSE}
+model_7 <- lmer(place_ap ~ economic_index*multiparty_ap + political_index + cultural_index +  
+                  placetype_best + partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_ur_ru)
+
+summary(model_7)
+```
+
+# Model 8: Political Index X Partisan Affective Polarization
+
+```{r, echo=F, include=FALSE}
+model_8 <- lmer(place_ap ~ economic_index + political_index*multiparty_ap + cultural_index +  
+                  placetype_best + partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_ur_ru)
+
+summary(model_8)
+```
+
+# Model 9: Cultural Index X Partisan Affective Polarization
+
+```{r, echo=F, include=FALSE}
+model_9 <- lmer(place_ap ~ economic_index + political_index + cultural_index*multiparty_ap +  
+                  placetype_best + partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_ur_ru)
+
+summary(model_9)
+```
+
+# Model 10: All Partisan Affective Polarization Interactions
+
+```{r, echo=F, include=FALSE}
+model_10 <- lmer(place_ap ~ economic_index*multiparty_ap + political_index*multiparty_ap + cultural_index*multiparty_ap +  
+                  placetype_best + partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_ur_ru)
+
+summary(model_10)
+```
+
+# Model 11: Economic Index X Place Idenity Interaction
+
+```{r, echo=F, include=FALSE}
+model_11 <- lmer(place_ap ~ economic_index*placeid + political_index + cultural_index +  
+                  placetype_best + partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_ur_ru)
+
+summary(model_11)
+```
+
+# Model 12: Political Index X Place Idenity Interaction
+
+```{r, echo=F, include=FALSE}
+model_12 <- lmer(place_ap ~ economic_index + political_index*placeid + cultural_index +  
+                  placetype_best + partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_ur_ru)
+
+summary(model_12)
+```
+
+# Model 13: Cultural Index X Place Idenity Interaction
+
+```{r, echo=F, include=FALSE}
+model_13 <- lmer(place_ap ~ economic_index + political_index + cultural_index*placeid +  
+                  placetype_best + partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_ur_ru)
+
+summary(model_13)
+```
+
+# Model 14: All Place Idenity Interactions
+
+```{r, echo=F, include=FALSE}
+model_14 <- lmer(place_ap ~ economic_index*placeid + political_index*placeid + cultural_index*placeid +  
+                  placetype_best + partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_ur_ru)
+
+summary(model_14)
+```
+
+# Model 15: ALL interactions
+
+```{r, echo=F, include=FALSE}
+model_15 <- lmer(place_ap ~ economic_index*placeid + political_index*placeid + cultural_index*placeid +  
+                  economic_index*ideology + political_index*ideology + cultural_index*ideology + 
+                   economic_index*multiparty_ap + political_index*multiparty_ap  + cultural_index*multiparty_ap + 
+                   placetype_best + partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_ur_ru)
+
+summary(model_15)
+```
+
+
+```{r, echo=F}
+
+models <- list(
+  "Model 1"  = model_1,
+  "Model 2"  = model_2,
+  "Model 3"  = model_3,
+  "Model 4"  = model_4,
+  "Model 5"  = model_5,
+  "Model 6"  = model_6,
+  "Model 7"  = model_7,
+  "Model 8"  = model_8,
+  "Model 9"  = model_9,
+  "Model 10" = model_10,
+  "Model 11" = model_11,
+  "Model 12" = model_12,
+  "Model 13" = model_13,
+  "Model 14" = model_14,
+  "Model 15" = model_15
+)
+
+# print with four significance levels:
+modelsummary(
+  models,
+  output = "markdown",
+  stars  = c(
+    "***" = 0.001,   # p ≤ .001
+    "**"  = 0.01,    # p ≤ .01
+    "*"   = 0.05,    # p ≤ .05
+    "."   = 0.1      # p ≤ .1
+  )
+)
+
+```
+
+## Rural Only Models
+
+# Model 1R: Objective Measures -> Place-Based Affective Polarization
+
+```{r, echo=F, include=FALSE}
+# filter to just rural people
+dat_rural <- dat_ur_ru %>%
+  filter(placetype_best == "Rural")
+
+model_1R <- lmer(place_ap ~ economic_index + political_index + cultural_index +  
+                  ideology + multiparty_ap + placeid1_rural + partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_rural)
+
+summary(model_1R)
+```
+# Model 2R: Objective Measures -> Place-Based Affective Polarization (Without Vairables of Interest )
+
+```{r, echo=F, include=FALSE}
+model_2R <- lmer(place_ap ~ economic_index + political_index + cultural_index +  
+                   partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_rural)
+
+summary(model_2R)
+```
+
+# Model 3R: Economic Index x Ideology
+
+```{r, echo=F, include=FALSE}
+model_3R <- lmer(place_ap ~ economic_index*ideology + political_index + cultural_index +  
+                   partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_rural)
+
+summary(model_3R)
+```
+
+
+# Model 4R: Political Index X Ideology 
+
+```{r, echo=F, include=FALSE}
+model_4R <- lmer(place_ap ~ economic_index + political_index*ideology + cultural_index +  
+                   partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_rural)
+
+summary(model_4R)
+```
+
+# Model 5R: Cultural Index X Ideology
+
+```{r, echo=F, include=FALSE}
+model_5R <- lmer(place_ap ~ economic_index + political_index + cultural_index*ideology +  
+                   partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_rural)
+
+summary(model_5R)
+```
+
+# Model 6R: All Ideology Interactions
+
+```{r, echo=F, include=FALSE}
+model_6R <- lmer(place_ap ~ economic_index*ideology + political_index*ideology + cultural_index*ideology +  
+                   partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_rural)
+
+summary(model_6R)
+```
+
+# Model 7R: Economic Index X Partisan Affective Polarization
+
+```{r, echo=F, include=FALSE}
+model_7R <- lmer(place_ap ~ economic_index*multiparty_ap + political_index + cultural_index +  
+                  partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_rural)
+
+summary(model_7R)
+```
+
+# Model 8R: Political Index X Partisan Affective Polarization
+
+```{r, echo=F, include=FALSE}
+model_8R <- lmer(place_ap ~ economic_index + political_index*multiparty_ap + cultural_index +  
+                 partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_rural)
+
+summary(model_8R)
+```
+
+
+# Model 9R: Cultural Index X Partisan Affective Polarization
+
+```{r, echo=F, include=FALSE}
+model_9R <- lmer(place_ap ~ economic_index + political_index + cultural_index*multiparty_ap +  
+                   partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_rural)
+
+summary(model_9R)
+```
+
+# Model 10R: All Partisan Affective Polarization Interactions
+
+```{r, echo=F, include=FALSE}
+model_10R <- lmer(place_ap ~ economic_index*multiparty_ap + political_index*multiparty_ap + cultural_index*multiparty_ap +  
+                   partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_rural)
+
+summary(model_10R)
+```
+
+# Model 11R: Economic Index X Place Idenity Interaction
+
+```{r, echo=F, include=FALSE}
+model_11R <- lmer(place_ap ~ economic_index*placeid1_rural + political_index + cultural_index +  
+                   partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_rural)
+
+summary(model_11R)
+```
+
+# Model 12R: Political Index X Place Idenity Interaction
+
+```{r, echo=F, include=FALSE}
+model_12R <- lmer(place_ap ~ economic_index + political_index*placeid1_rural + cultural_index +  
+                   partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_rural)
+
+summary(model_12R)
+```
+
+# Model 13R: Cultural Index X Place Idenity Interaction
+
+```{r, echo=F, include=FALSE}
+model_13R <- lmer(place_ap ~ economic_index + political_index + cultural_index*placeid1_rural +  
+                   partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_rural)
+
+summary(model_13R)
+```
+
+# Model 14R: All Place Idenity Interactions
+
+```{r, echo=F, include=FALSE}
+model_14R <- lmer(place_ap ~ economic_index*placeid1_rural + political_index*placeid1_rural + cultural_index*placeid1_rural +  
+                   partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_rural)
+
+summary(model_14R)
+```
+
+# Model 15R: ALL interactions
+
+```{r, echo=F, include=FALSE}
+model_15R <- lmer(place_ap ~ economic_index*placeid1_rural + political_index*placeid1_rural + cultural_index*placeid1_rural +  
+                  economic_index*ideology + political_index*ideology + cultural_index*ideology + 
+                   economic_index*multiparty_ap + political_index*multiparty_ap  + cultural_index*multiparty_ap + 
+                   partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_rural)
+
+summary(model_15R)
+```
+
+```{r, echo=F}
+models_rural <- list(
+  "Model 1"  = model_1R,
+  "Model 2"  = model_2R,
+  "Model 3"  = model_3R,
+  "Model 4"  = model_4R,
+  "Model 5"  = model_5R,
+  "Model 6"  = model_6R,
+  "Model 7"  = model_7R,
+  "Model 8"  = model_8R,
+  "Model 9"  = model_9R,
+  "Model 10" = model_10R,
+  "Model 11" = model_11R,
+  "Model 12" = model_12R,
+  "Model 13" = model_13R,
+  "Model 14" = model_14R,
+  "Model 15" = model_15R
+)
+
+# print with four significance levels:
+modelsummary(
+  models_rural,
+  output = "markdown",
+  stars  = c(
+    "***" = 0.001,   # p ≤ .001
+    "**"  = 0.01,    # p ≤ .01
+    "*"   = 0.05,    # p ≤ .05
+    "."   = 0.1      # p ≤ .1
+  )
+)
+
+```
+
+# Urban Only
+
+# Model 1U: Objective Measures -> Place-Based Affective Polarization
+
+```{r, echo=F, include=FALSE}
+# filter to just urban people
+dat_urban <- dat_ur_ru %>%
+  filter(placetype_best == "Urban")
+
+model_1U <- lmer(place_ap ~ economic_index + political_index + cultural_index +  
+                  ideology + multiparty_ap + placeid1_urban + partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_urban)
+
+summary(model_1U)
+```
+# Model 2U: Objective Measures -> Place-Based Affective Polarization (Without Vairables of Interest )
+
+```{r, echo=F, include=FALSE}
+model_2U <- lmer(place_ap ~ economic_index + political_index + cultural_index +  
+                   partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_urban)
+
+summary(model_2U)
+```
+
+# Model 3U: Economic Index x Ideology
+
+```{r, echo=F, include=FALSE}
+model_3U <- lmer(place_ap ~ economic_index*ideology + political_index + cultural_index +  
+                   partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_urban)
+
+summary(model_3U)
+```
+
+
+# Model 4U: Political Index X Ideology 
+
+```{r, echo=F, include=FALSE}
+model_4U <- lmer(place_ap ~ economic_index + political_index*ideology + cultural_index +  
+                   partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_urban)
+
+summary(model_4U)
+```
+
+# Model 5U: Cultural Index X Ideology
+
+```{r, echo=F, include=FALSE}
+model_5U <- lmer(place_ap ~ economic_index + political_index + cultural_index*ideology +  
+                   partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_urban)
+
+summary(model_5U)
+```
+
+# Model 6U: All Ideology Interactions
+
+```{r, echo=F, include=FALSE}
+model_6U <- lmer(place_ap ~ economic_index*ideology + political_index*ideology + cultural_index*ideology +  
+                   partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_urban)
+
+summary(model_6U)
+```
+
+# Model 7U: Economic Index X Partisan Affective Polarization
+
+```{r, echo=F, include=FALSE}
+model_7U <- lmer(place_ap ~ economic_index*multiparty_ap + political_index + cultural_index +  
+                  partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_urban)
+
+summary(model_7U)
+```
+
+# Model 8U: Political Index X Partisan Affective Polarization
+
+```{r, echo=F, include=FALSE}
+model_8U <- lmer(place_ap ~ economic_index + political_index*multiparty_ap + cultural_index +  
+                 partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_urban)
+
+summary(model_8U)
+```
+
+# Model 9U: Cultural Index X Partisan Affective Polarization
+
+```{r, echo=F, include=FALSE}
+model_9U <- lmer(place_ap ~ economic_index + political_index + cultural_index*multiparty_ap +  
+                   partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_urban)
+
+summary(model_9U)
+```
+
+# Model 10U: All Partisan Affective Polarization Interactions
+
+```{r, echo=F, include=FALSE}
+model_10U <- lmer(place_ap ~ economic_index*multiparty_ap + political_index*multiparty_ap + cultural_index*multiparty_ap +  
+                   partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_urban)
+
+summary(model_10U)
+```
+
+# Model 11U: Economic Index X Place Idenity Interaction
+
+```{r, echo=F, include=FALSE}
+model_11U <- lmer(place_ap ~ economic_index*placeid1_urban + political_index + cultural_index +  
+                   partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_urban)
+
+summary(model_11U)
+```
+
+# Model 12U: Political Index X Place Idenity Interaction
+
+```{r, echo=F, include=FALSE}
+model_12U <- lmer(place_ap ~ economic_index + political_index*placeid1_urban + cultural_index +  
+                   partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_urban)
+
+summary(model_12U)
+```
+
+# Model 13U: Cultural Index X Place Idenity Interaction
+
+```{r, echo=F, include=FALSE}
+model_13U <- lmer(place_ap ~ economic_index + political_index + cultural_index*placeid1_urban +  
+                   partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_urban)
+
+summary(model_13U)
+```
+
+# Model 14U: All Place Idenity Interactions
+
+```{r, echo=F, include=FALSE}
+model_14U <- lmer(place_ap ~ economic_index*placeid1_urban + political_index*placeid1_urban + cultural_index*placeid1_urban +  
+                   partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_urban)
+
+summary(model_14U)
+```
+
+# Model 15U: ALL interactions
+
+```{r, echo=F, include=FALSE}
+model_15U <- lmer(place_ap ~ economic_index*placeid1_urban + political_index*placeid1_urban + cultural_index*placeid1_urban +  
+                  economic_index*ideology + political_index*ideology + cultural_index*ideology + 
+                   economic_index*multiparty_ap + political_index*multiparty_ap  + cultural_index*multiparty_ap + 
+                   partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_urban)
+
+summary(model_15U)
+```
+
+```{r, echo=F}
+models_urban <- list(
+  "Model 1"  = model_1U,
+  "Model 2"  = model_2U,
+  "Model 3"  = model_3U,
+  "Model 4"  = model_4U,
+  "Model 5"  = model_5U,
+  "Model 6"  = model_6U,
+  "Model 7"  = model_7U,
+  "Model 8"  = model_8U,
+  "Model 9"  = model_9U,
+  "Model 10" = model_10U,
+  "Model 11" = model_11U,
+  "Model 12" = model_12U,
+  "Model 13" = model_13U,
+  "Model 14" = model_14U,
+  "Model 15" = model_15U
+)
+
+# print with four significance levels:
+modelsummary(
+  models_urban,
+  output = "markdown",
+  stars  = c(
+    "***" = 0.001,   # p ≤ .001
+    "**"  = 0.01,    # p ≤ .01
+    "*"   = 0.05,    # p ≤ .05
+    "."   = 0.1      # p ≤ .1
+  )
+)
+```
+
+
+# Plotting Interactions of Interest
+
+```{r}
+library(marginaleffects)
+library(ggplot2)
+
+# 1) Compute the conditional slope of economic_index at many levels of multiparty_ap
+s7 <- slopes(
+  model       = model_7R,
+  variables   = "economic_index",
+  condition   = datagrid(
+                  model         = model_7R,
+                  multiparty_ap = seq(
+                                     from   = min(dat_ur_ru$multiparty_ap, na.rm = TRUE),
+                                     to     = max(dat_ur_ru$multiparty_ap, na.rm = TRUE),
+                                     length = 100
+                                   )
+                ),
+  re.form     = NA
+)
+
+# s7 now has columns:
+#   multiparty_ap | estimate (the slope) | conf.low | conf.high
+
+# 2) Plot the slope of economic_index as a function of multiparty_ap
+ggplot(s7, aes(x = multiparty_ap, y = estimate)) +
+  geom_line(size = 1) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.2) +
+  labs(
+    x     = "Partisan Affective Polarization AP",
+    y     = "Marginal Effect of Economic Neglect on Place-AP",
+    title = "Figure 10. How the Economic-Neglect Slope Varies with Partisan-AP"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+s10 <- slopes(
+  model       = model_10R,
+  variables   = "economic_index",
+  condition   = datagrid(
+                  model         = model_10R,
+                  multiparty_ap = seq(min(dat_ur_ru$multiparty_ap, na.rm = TRUE),
+                                      max(dat_ur_ru$multiparty_ap, na.rm = TRUE),
+                                      length = 100)
+                ),
+  re.form     = NA
+)
+
+# combine and label
+s_all <- bind_rows(
+  s7  |> mutate(model = "Model 7R"),
+  s10 |> mutate(model = "Model 10R")
+)
+
+ggplot(s_all, aes(x = multiparty_ap, y = estimate, color = model, fill = model)) +
+  geom_line(size = 1) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.2) +
+  labs(
+    x    = "Multiparty AP",
+    y    = "Marginal Effect of Economic Neglect",
+    color = "Model",
+    fill  = "Model"
+  ) +
+  theme_minimal()
+
+```
+
+It looks like economic neglect suppresses place-based affective polarization the most for people with low partisan affective polarization. Economic neglect’s suppressing effect weakens as partisan affective polarization gets higher. 
+
+
+# Model with Income quantiles
+
+```{r}
+dat_rural <- dat_rural %>%
+  # 1) Turn “99” into NA
+  mutate(income = na_if(income, 99)) %>%
+  # 2) Create a quartile‐based factor
+  mutate(income_cat = ntile(income, 4)) %>%
+  mutate(
+    income_cat = factor(income_cat,
+                        levels = 1:4,
+                        labels = c("Q1 (low)", "Q2", "Q3", "Q4 (high)"))
+  )
+
+model_2R_B <- lmer(place_ap ~ economic_index + political_index + cultural_index +  
+                   partisanship + agecat + gender + income_cat +
+                  education + (1 | region), data = dat_rural)
+
+summary(model_2R_B)
+```
+
+```{r}
+# packages
+library(lmerTest)      # p-values for lmer
+library(broom.mixed)   # tidy() for lmer
+library(dplyr)
+library(stringr)
+library(ggplot2)
+
+# - - - fit the two models - - -
+# Base model 
+model_2R_B <- lmer(
+  place_ap ~ economic_index + political_index + cultural_index +
+    partisanship + agecat + gender + income_cat + education + (1 | region),
+  data = dat_rural
+)
+
+# Interactive model: add economic_index x income_cat
+model_2R_I <- lmer(
+  place_ap ~ economic_index * income_cat + political_index + cultural_index +
+    partisanship + agecat + gender + income_cat + education + (1 | region),
+  data = dat_rural
+)
+
+# - - - tidy and combine - - -
+tidy_mod <- function(m, label) {
+  tidy(m, effects = "fixed", conf.int = TRUE) |>
+    filter(term != "(Intercept)") |>
+    mutate(model = label)
+}
+
+tb <- tidy_mod(model_2R_B, "Base Model")
+ti <- tidy_mod(model_2R_I, "Interactive Model")
+
+coefs <- bind_rows(tb, ti) |>
+  mutate(sig = if_else(p.value < 0.1, "p < 0.1", "n.s."))
+
+# - - - robust relabeling (keeps originals if no rule matches) - - -
+relabel_term <- function(x) {
+  out <- x
+
+  # main indices
+  out <- str_replace(out, "^economic_index$", "Economic Index")
+  out <- str_replace(out, "^political_index$", "Political Index")
+  out <- str_replace(out, "^cultural_index$", "Cultural Index")
+
+  # income mains
+  out <- str_replace(out, "^income_catQ2$", "Income Q2")
+  out <- str_replace(out, "^income_catQ3$", "Income Q3")
+  out <- str_replace(out, "^income_catQ4$", "Income Q4 (high)")
+
+  # interactions: economic_index:income_catQk
+  out <- str_replace(out, "^economic_index:income_catQ2$", "Econ. Index × Income Q2")
+  out <- str_replace(out, "^economic_index:income_catQ3$", "Econ. Index × Income Q3")
+  out <- str_replace(out, "^economic_index:income_catQ4$", "Econ. Index × Income Q4 (high)")
+
+  # gender
+  out <- str_replace(out, "^genderMan$", "Man")
+  out <- str_replace(out, "^genderOther$", "Other Gender")
+
+  # age (handle hyphen or en dash)
+  out <- str_replace(out, "^agecat30.?44$", "Age 30-44")
+  out <- str_replace(out, "^agecat45.?59$", "Age 45-59")
+  out <- str_replace(out, "^agecat60\\+$", "Age 60+")
+
+  # education
+  out <- str_replace(out, "^educationSome Postsecondary$", "Some Postsecondary")
+  out <- str_replace(out, "^educationCollege Diploma$", "College Diploma")
+  out <- str_replace(out, "^educationUniversity Degree$", "University Degree")
+
+  # partisanship dummies: partisanshipX -> "X ID"
+  # handles Conservative, Green, Liberal, NDP 
+  out <- ifelse(
+    str_detect(out, "^partisanship"),
+    paste0(str_replace(out, "^partisanship", ""), " ID") |>
+      str_replace("^Conservative ID$", "Conservative ID") |>
+      str_replace("^Green ID$", "Green ID") |>
+      str_replace("^Liberal ID$", "Liberal ID") |>
+      str_replace("^NDP ID$", "NDP ID"),
+    out
+  )
+
+  # fallback: if empty, keep original
+  out[is.na(out) | out == ""] <- x[is.na(out) | out == ""]
+  out
+}
+
+coefs <- coefs |>
+  mutate(term_label = relabel_term(term))
+
+# - - - set order safely (only use labels that exist) - - -
+wanted <- c(
+  "Economic Index","Political Index","Cultural Index",
+  "Conservative ID","Green ID","Liberal ID","NDP ID",
+  "Age 30-44","Age 45-59","Age 60+",
+  "Man","Other Gender",
+  "Income Q2","Income Q3","Income Q4 (high)",
+  "Some Postsecondary","College Diploma","University Degree",
+  "Econ. Index × Income Q2","Econ. Index × Income Q3","Econ. Index × Income Q4 (high)"
+)
+
+present <- unique(coefs$term_label)
+order_levels <- c(wanted[wanted %in% present], setdiff(present, wanted))
+
+coefs <- coefs |>
+  mutate(term_label = factor(term_label, levels = rev(order_levels)))  # top to bottom like table
+
+# - - - plot - - -
+ggplot(coefs, aes(x = estimate, y = term_label)) +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.3, colour = "grey40") +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high, colour = sig), height = 0.18) +
+  geom_point(aes(colour = sig), size = 2) +
+  facet_wrap(~ model) +
+  scale_colour_manual(values = c("n.s." = "grey60", "p < 0.1" = "orange")) +
+  labs(
+    x = "Estimate (95% CI)",
+    y = NULL,
+    title = "Figure 19. Full Coefficients for Income-Quartile Models",
+    colour = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(face = "bold"),
+    legend.position = "bottom"
+  )
+
+# if anything still slipped through, this will show un-relabelled terms 
+setdiff(unique(coefs$term), unique(coefs$term_label))
+
+```
+
+```{r}
+# Packages
+library(lmerTest)      # lmer with p-values
+library(modelsummary)  # nice tables to Word
+library(dplyr)
+
+# --- Fit the two models ---
+
+# A) Education × Economic neglect
+model_edu_int <- lmer(
+  place_ap ~ economic_index * education +
+    political_index + cultural_index +
+    partisanship + agecat + gender + income_cat +
+    (1 | region),
+  data = dat_rural
+)
+
+# B) Partisanship × Economic neglect
+model_party_int <- lmer(
+  place_ap ~ economic_index * partisanship +
+    political_index + cultural_index +
+    agecat + gender + income_cat + education +
+    (1 | region),
+  data = dat_rural
+)
+
+# --- nice coefficient labels (will apply when names match) ---
+coef_labels <- c(
+  "(Intercept)" = "Intercept",
+  "economic_index" = "Economic Index",
+  "political_index" = "Political Index",
+  "cultural_index"  = "Cultural Index",
+  "agecat30-44"     = "Age 30–44",
+  "agecat45-59"     = "Age 45–59",
+  "agecat60+"       = "Age 60+",
+  "genderMan"       = "Man",
+  "genderOther"     = "Other Gender",
+  "income_catQ2"    = "Income Q2",
+  "income_catQ3"    = "Income Q3",
+  "income_catQ4"    = "Income Q4 (high)",
+  "educationSome Postsecondary" = "Some Postsecondary",
+  "educationCollege Diploma"    = "College Diploma",
+  "educationUniversity Degree"  = "University Degree",
+  "partisanshipConservative" = "Conservative ID",
+  "partisanshipGreen"        = "Green ID",
+  "partisanshipLiberal"      = "Liberal ID",
+  "partisanshipNDP"          = "NDP ID",
+  # interactions
+  "economic_index:educationSome Postsecondary" = "Econ. Index × Some Postsecondary",
+  "economic_index:educationCollege Diploma"    = "Econ. Index × College Diploma",
+  "economic_index:educationUniversity Degree"  = "Econ. Index × University Degree",
+  "economic_index:partisanshipConservative"    = "Econ. Index × Conservative ID",
+  "economic_index:partisanshipGreen"           = "Econ. Index × Green ID",
+  "economic_index:partisanshipLiberal"         = "Econ. Index × Liberal ID",
+  "economic_index:partisanshipNDP"             = "Econ. Index × NDP ID"
+)
+
+# --- Export both to one Word table ---
+# Stars & SEs formatted like thesis (SE in parentheses, stars on estimates)
+modelsummary(
+  list(
+    "Edu × Econ neglect"   = model_edu_int,
+    "Party × Econ neglect" = model_party_int
+  ),
+  coef_map  = coef_labels,
+  statistic = "({std.error})",
+  stars     = c('*' = .05, '**' = .01, '***' = .001, '+' = .10),
+  gof_omit  = "IC|Log.Lik|Adj|Deviance",   # hide extras; keep N, R2 if available
+  output    = "econ_interactions_table.docx",
+  title     = "Models with Interactions of Economic Neglect"
+)
+
+
+```
+
+```{r}
+library(ggeffects)
+library(ggplot2)
+
+# Predictions
+pred_income <- ggpredict(model_2R_B, 
+                         terms = c("economic_index [-2:2 by=0.5]", "income_cat"))
+
+# Cleaner plot
+ggplot(pred_income, aes(x = x, y = predicted, colour = group, fill = group)) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high),
+              alpha = 0.15, colour = NA) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2) +
+  scale_colour_manual(values = c("#D55E00", "#0072B2", "#009E73", "#CC79A7")) +
+  scale_fill_manual(values = c("#D55E00", "#0072B2", "#009E73", "#CC79A7")) +
+  labs(
+    x = "Economic Neglect",
+    y = "Predicted Place-Based Affective Polarization",
+    colour = "Income Quartile",
+    fill = "Income Quartile",
+    title = "Figure 20. Average Predicted Place-Based AP by Income"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "top",
+    panel.grid.minor = element_blank()
+  )
+
+
+```
+
+
+```{r}
+model_income_cat <- lmer(place_ap ~ economic_index*income_cat + political_index + cultural_index +  
+                   partisanship + agecat + gender  +
+                  education + (1 | region), data = dat_rural)
+
+summary(model_income_cat)
+```
+
+
+```{r}
+# 1. Add an “All” category and bind with the Urban/Rural subsets
+dat_hist <- dat_ur_ru %>%
+  mutate(group = "All") %>%
+  bind_rows(
+    dat_ur_ru %>% 
+      mutate(group = placetype_best)
+  ) %>%
+  # set factor levels so the facets appear in a logical order
+  mutate(group = factor(group, levels = c("All", "Rural", "Urban")))
+
+# 2. Plot the three histograms as facets
+ggplot(dat_hist, aes(x = political_index)) +
+  geom_histogram(binwidth = 1, colour = "black", fill = "grey") +
+  facet_wrap(~ group, nrow = 1) +
+  labs(
+    x = "Political index",
+    y = "Count"
+  ) +
+  theme_minimal()+
+  ggtitle("Figure 1. Distribution of the Political Index")
+```
+
+
+
+```{r}
+# 1. Add the mean per group
+dat_hist2 <- dat_hist %>%
+  group_by(group) %>%
+  mutate(mean_pol = mean(political_index, na.rm = TRUE)) %>%
+  ungroup()
+
+# 2. Plot with a legend for the mean‐line
+ggplot(dat_hist2, aes(x = political_index)) +
+  geom_histogram(binwidth = 1, colour = "black", fill = "grey", show.legend = FALSE) +
+  geom_vline(aes(xintercept = mean_pol, color = "Mean"), 
+             linetype = "dashed", size = 0.7) +
+  scale_color_manual(name = "",         # legend title
+                     values = c(Mean = "red")) +
+  facet_wrap(~ group, nrow = 1) +
+  labs(
+    x = "Political index",
+    y = "Count"
+  ) +
+  theme_minimal() +
+  ggtitle("Figure 1. Distribution of the Political Index")
+
+```
+
+
+```{r}
+# 2. Plot the three histograms as facets
+ggplot(dat_hist, aes(x = economic_index)) +
+  geom_histogram(binwidth = 1, colour = "black", fill = "grey") +
+  facet_wrap(~ group, nrow = 1) +
+  labs(
+    x = "Economic index",
+    y = "Count"
+  ) +
+  theme_minimal()+
+  ggtitle("Figure 2. Distribution of the Economic Index")
+```
+
+
+```{r}
+# 1. Compute mean per facet for economic_index
+dat_hist2 <- dat_hist %>%
+  group_by(group) %>%
+  mutate(mean_econ = mean(economic_index, na.rm = TRUE)) %>%
+  ungroup()
+
+# 2. Plot with a legend entry for the mean line
+ggplot(dat_hist2, aes(x = economic_index)) +
+  geom_histogram(binwidth = 1, colour = "black", fill = "grey", show.legend = FALSE) +
+  geom_vline(aes(xintercept = mean_econ, color = "Mean"),
+             linetype = "dashed", size = 0.7) +
+  scale_color_manual(name = "",        # blank legend title
+                     values = c(Mean = "red")) +
+  facet_wrap(~ group, nrow = 1) +
+  labs(
+    x = "Economic index",
+    y = "Count"
+  ) +
+  theme_minimal() +
+  ggtitle("Figure 3. Distribution of the Economic Index")
+```
+
+
+```{r}
+# 2. Plot the three histograms as facets
+ggplot(dat_hist, aes(x = cultural_index)) +
+  geom_histogram(binwidth = 1, colour = "black", fill = "grey") +
+  facet_wrap(~ group, nrow = 1) +
+  labs(
+    x = "Cultural index",
+    y = "Count"
+  ) +
+  theme_minimal()+
+  ggtitle("Figure 3. Distribution of the Cultural Index")
+```
+
+
+```{r}
+# 1. Compute the mean per facet for cultural_index
+dat_hist2 <- dat_hist %>%
+  group_by(group) %>%
+  mutate(mean_cult = mean(cultural_index, na.rm = TRUE)) %>%
+  ungroup()
+
+# 2. Plot with a legend entry for the mean line
+ggplot(dat_hist2, aes(x = cultural_index)) +
+  geom_histogram(binwidth = 1, colour = "black", fill = "grey", show.legend = FALSE) +
+  geom_vline(aes(xintercept = mean_cult, color = "Mean"),
+             linetype = "dashed", size = 0.7) +
+  scale_color_manual(name = "",         # blank legend title
+                     values = c(Mean = "red")) +
+  facet_wrap(~ group, nrow = 1) +
+  labs(
+    x = "Cultural index",
+    y = "Count"
+  ) +
+  theme_minimal() +
+  ggtitle("Figure 5. Distribution of the Cultural Index")
+```
+
+
+```{r}
+index_data <- dat_ur_ru %>%
+  select(political_index, economic_index, cultural_index)
+
+# compute Cronbach’s alpha
+alpha_result <- alpha(index_data)
+
+# print the full results
+print(alpha_result)
+
+# raw alpha coefficient for all put together
+alpha_result$total$raw_alpha
+```
+
+```{r}
+# 1. define the item‐sets for each index
+political_items <- c("distance_to_hosp_log_z", "distance_to_bridge_log_z", "broadband_score_z")  
+economic_items  <- c("income_log_z", "unemployment_rate_z")  
+cultural_items  <- c("university_density_100km_z", "cultural_score_z")  
+
+# 2. compute Cronbach’s alpha for each
+alpha_political <- alpha(dat_ur_ru[ , political_items ])
+alpha_economic  <- alpha(dat_ur_ru[ , economic_items ])
+alpha_cultural  <- alpha(dat_ur_ru[ , cultural_items ])
+
+# 3. view full outputs
+print(alpha_political)
+print(alpha_economic)
+print(alpha_cultural)
+
+# 4. raw alpha coefficients:
+alpha_political$total$raw_alpha
+alpha_economic$total$raw_alpha
+alpha_cultural$total$raw_alpha
+```
+
+```{r}
+model_2R_C <- lmer(therm1_1 ~ economic_index + political_index + cultural_index +  
+                   partisanship + agecat + gender + 
+                  education + (1 | region), data = dat_rural)
+
+summary(model_2R_C)
+```
+
+
+```{r}
+ggplot(dat_ur_ru, aes(x = place_ap, fill = placetype_best)) +
+  geom_histogram(position = "identity", binwidth = 1, alpha = 0.5, colour = "black") +
+  scale_fill_manual(values = c("Urban" = "steelblue", "Rural" = "darkorange")) +
+  labs(
+    x = "Place-based affective polarization",
+    y = "Count",
+    fill = "Place type"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+ggplot(dat_ur_ru, aes(x = place_ap, fill = placetype_best)) +
+  geom_density(alpha = 0.4, adjust = 2) +
+  scale_fill_manual(values = c("Urban" = "steelblue", "Rural" = "darkorange")) +
+  labs(
+    x = "Place-based affective polarization",
+    y = "Density",
+    fill = "Place type"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+ggplot(dat_ur_ru, aes(x = placetype_best, y = place_ap, fill = placetype_best)) +
+  geom_violin(alpha = 0.5, colour = "black") +
+  scale_fill_manual(values = c("Urban" = "steelblue", "Rural" = "darkorange")) +
+  labs(
+    x = "Place type",
+    y = "Place-based affective polarization"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+ggplot(dat_ur_ru, aes(x = place_ap, fill = placetype_best)) +
+  geom_density(alpha = 0.5, adjust = 2, color = NA) +
+  scale_fill_manual(values = c("Urban" = "purple", "Rural" = "orange")) +
+  labs(
+    title = "Figure 7. Distribution of Place-Based Affective Polarization",
+    x = "Affective Polarization Score",
+    y = "Density",
+    fill = "Group"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(hjust = 0.5)
+  )
+```
+
+
+
+```{r}
+# figure 8, in-group and out-group affect for each place-type
+# therm1_1 how do you feel about urban people
+# therm1_3 how do you feel about rural people
+# 1. Pivot to long format and flag in‑group vs out‑group
+dat_long <- dat_ur_ru %>%
+  select(placetype_best, therm1_1, therm1_3) %>%
+  pivot_longer(
+    cols      = c(therm1_1, therm1_3),
+    names_to  = "variable",
+    values_to = "feeling"
+  ) %>%
+  mutate(type = case_when(
+    placetype_best == "Urban" & variable == "therm1_1" ~ "In‑group",
+    placetype_best == "Urban" & variable == "therm1_3" ~ "Out‑group",
+    placetype_best == "Rural" & variable == "therm1_3" ~ "In‑group",
+    placetype_best == "Rural" & variable == "therm1_1" ~ "Out‑group"
+  ))
+
+# 2. Plot overlapping histograms by facet
+ggplot(dat_long, aes(x = feeling, fill = type)) +
+  geom_density(binwidth   = 1,
+                 position   = "identity",
+                 alpha      = 0.5,
+                 colour     = "black") +
+  facet_wrap(~ placetype_best, nrow = 1) +
+  scale_fill_manual(
+    name   = "",
+    values = c("In‑group" = "steelblue", "Out‑group" = "grey")
+  ) +
+  labs(
+    x    = "Feeling thermometer (0–10)",
+    y    = "Count"
+  ) +
+  theme_minimal() +
+  ggtitle("Figure 8. Distribution of In‑group vs Out‑group Feelings by Place-Type")
+```
+
+
+```{r}
+# Exporting Models to nice table
+models <- list(
+  "All Respondents" = model_2,
+  "Rural Only" = model_2R,
+  "Urban Only" = model_2U
+)
+
+coef_names <- c(
+  "(Intercept)" = "Intercept",
+  "economic_index" = "Economic Index",
+  "political_index" = "Political Index",
+  "cultural_index" = "Cultural Index",
+  "partisanshipConservative" = "Conservative ID",
+  "partisanshipGreen" = "Green ID",
+  "partisanshipLiberal" = "Liberal ID",
+  "partisanshipNDP" = "NDP ID",
+  "agecat30-44" = "Age: 30–44",
+  "agecat45-59" = "Age: 45–59",
+  "agecat60 or older" = "Age: 60+",
+  "genderMan" = "Man",
+  "genderOther" = "Other Gender",
+  "educationSome postsecondary" = "Some Postsecondary",
+  "educationCollege diploma" = "College Diploma",
+  "educationUniversity degree" = "University Degree"
+)
+
+```
+
+```{r}
+modelplot(model_2R, coef_map = coef_names) +
+  ggplot2::theme_minimal() +
+  ggplot2::labs(
+    title = "Coefficient Plot: Rural Respondents",
+    x = "Estimate",
+    y = NULL
+  )
+```
+
+```{r}
+library(broom.mixed)
+
+# Extract from model summary
+summary_table <- summary(model_2R)$coefficients %>% as.data.frame()
+summary_table$term <- rownames(summary_table)
+
+# Extract Wald confidence intervals
+conf <- confint(model_2R, method = "Wald") %>% as.data.frame()
+conf$term <- rownames(conf)
+
+coefs <- summary(model_2R)$coefficients %>%
+  as.data.frame() %>%
+  rename(
+    estimate = Estimate,
+    std.error = `Std. Error`,
+    p.value   = `Pr(>|t|)`
+  ) %>%
+  mutate(term = rownames(.)) %>%
+  filter(term != "(Intercept)") %>%
+  left_join(
+    confint(model_2R, method = "Wald") %>% 
+      as.data.frame() %>% 
+      mutate(term = rownames(.)),
+    by = "term"
+  ) %>%
+  mutate(
+    conf.low  = `2.5 %`,
+    conf.high = `97.5 %`,
+    highlight = ifelse(term == "political_index", "Political Index", "Other"),
+    sig       = ifelse(p.value < 0.1, "Significant", "Not Significant"),
+    label = case_when(
+      term == "economic_index"             ~ "Economic Index",
+      term == "political_index"            ~ "Political Index",
+      term == "cultural_index"             ~ "Cultural Index",
+      term == "partisanshipConservative"   ~ "Conservative ID",
+      term == "partisanshipGreen"          ~ "Green ID",
+      term == "partisanshipLiberal"        ~ "Liberal ID",
+      term == "partisanshipNDP"            ~ "NDP ID",
+      term == "agecat30-44"                ~ "Age: 30–44",
+      term == "agecat45-59"                ~ "Age: 45–59",
+      term == "agecat60 or older"          ~ "Age: 60+",
+      term == "genderMan"                  ~ "Man",
+      term == "genderOther"                ~ "Other Gender",
+      term == "educationSome postsecondary"~ "Some Postsecondary",
+      term == "educationCollege diploma"   ~ "College Diploma",
+      term == "educationUniversity degree" ~ "University Degree",
+      TRUE                                 ~ term
+    )
+  )
+
+ggplot(coefs, aes(x = estimate, y = reorder(label, estimate))) +
+  geom_point(aes(color = highlight, alpha = sig), size = 3) +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high,
+                     color = highlight, alpha = sig),
+                 height = 0.2) +
+  scale_color_manual(values = c("Political Index" = "darkorange", "Other" = "grey40")) +
+  scale_alpha_manual(values = c("Significant" = 1, "Not Significant" = 0.3)) +
+  guides(color = "none", alpha = "none") +
+  labs(
+    x = "Coefficient Estimate",
+    y = NULL,
+    title = "Figure 9. Coefficients for Rural Respondents"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+# Interaction Models Table
+# Thesis designation to code designation conversion: 
+# Ideology Interactions: Model 2A = model_4R ; Model 2B = model_3R ; Model 2C = model_5R
+# partisan AP interactions: Model 3A = model_8R ; Model 3B = model_7R ; Model 3C = model_9R
+# place ID interactions: Model 4A = model_12R ; Model 4B = model_11R ; Model 4C = model_13R
+
+interaction_models <- list(
+  "Model 2A" = model_4R,
+  "Model 2B" = model_3R,
+  "Model 2C" = model_5R,
+  "Model 3A" = model_8R,
+  "Model 3B" = model_7R,
+  "Model 3C" = model_9R,
+  "Model 4A" = model_12R,
+  "Model 4B" = model_11R,
+  "Model 4C" = model_13R
+)
+
+coef_map <- c(
+  "(Intercept)"                      = "Intercept",
+  "economic_index"                  = "Economic Index",
+  "political_index"                 = "Political Index",
+  "ideology"                        = "Ideology",
+  "cultural_index"                  = "Cultural Index",
+  "multiparty_ap"                   = "Multiparty AP",
+  "partisanshipConservative"        = "Conservative ID",
+  "partisanshipGreen"               = "Green ID",
+  "partisanshipLiberal"             = "Liberal ID",
+  "partisanshipNDP"                 = "NDP ID",
+  "agecat30-44"                     = "Age 30–44",
+  "agecat45-59"                     = "Age 45–59",
+  "agecat60 or older"               = "Age 60+",
+  "genderMan"                       = "Man",
+  "genderOther"                     = "Other Gender",
+  "educationSome postsecondary"     = "Some Postsecondary",
+  "educationCollege diploma"        = "College Diploma",
+  "educationUniversity degree"      = "University Degree",
+  "political_index:ideology"        = "Pol. Index × Ideology",
+  "economic_index:ideology"         = "Econ. Index × Ideology",
+  "cultural_index:ideology"         = "Cult. Index × Ideology",
+  "political_index:multiparty_ap"   = "Pol. Index × Multiparty AP",
+  "economic_index:multiparty_ap"    = "Econ. Index × Multiparty AP",
+  "cultural_index:multiparty_ap"    = "Cult. Index × Multiparty AP",
+  "placeid1_rural"                  = "Place ID (Rural)",
+  "political_index:placeid1_rural"  = "Pol. Index × Place ID",
+  "economic_index:placeid1_rural"   = "Econ. Index × Place ID",
+  "cultural_index:placeid1_rural"   = "Cult. Index × Place ID"
+)
+
+# modelsummary(
+#   interaction_models,
+#   stars = c("+" =  0.1,
+#             "*" =  0.05,
+#             "**" = 0.01,
+#             "***"= 0.001),
+#   coef_map = coef_map,
+#   title = "Table X. Interaction Models",
+#   notes = c(
+#     "Standard errors in parentheses.",
+#     "+ p<.1; * p<.05; ** p<.01; *** p<.001"
+#   ),
+#   output = "interaction_models.docx"
+# )
+```
+
+```{r, fig.height=16}
+# tidy each model into one big data frame
+all_coefs <- bind_rows(
+  lapply(names(interaction_models), function(m) {
+    tidy(interaction_models[[m]], conf.int = TRUE) %>%
+      mutate(model = m)
+  })
+)
+
+# the original names of the four terms
+highlight_terms <- c(
+  "placeid1_rural",
+  "ideology",
+  "multiparty_ap",
+  "economic_index:multiparty_ap"
+)
+
+fig7 <-  all_coefs %>%
+  mutate(
+    label = recode(term, !!!coef_map),        
+    color = if_else(term %in% highlight_terms, "highlight", "normal")
+  ) %>%
+  ggplot(aes(estimate, label, color = color)) +
+    geom_point() +
+    geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0) +
+    facet_wrap(~ model) +
+    scale_color_manual(values = c(normal = "black", highlight = "orange")) +
+    labs(
+      x = "Estimate (95% CI)",
+      y = NULL,
+      title = "Figure 7. Interaction Models: Coefficient Estimates"
+    ) +
+    theme_minimal()+
+  theme(legend.position  = "none")
+
+
+
+# ggsave(
+#   filename = "fig7.png",  # or include a path: "plots/fig7.png"
+#   plot     = fig7,
+#   width    = 8,           # in inches
+#   height   = 14,
+#   dpi      = 300
+# )
+
+fig7
+```
+
+```{r}
+# 1. Define the terms to show
+keep_terms <- c(
+  "political_index",
+  "economic_index",
+  "cultural_index",
+  "political_index:multiparty_ap",
+  "economic_index:multiparty_ap",
+  "cultural_index:multiparty_ap"
+)
+
+# 2. Make a simple label‐map for nicer axis labels
+label_map <- c(
+  political_index                       = "Political index",
+  economic_index                        = "Economic index",
+  cultural_index                        = "Cultural index",
+  `political_index:multiparty_ap`       = "Political index × MP AP",
+  `economic_index:multiparty_ap`        = "Economic index × MP AP",
+  `cultural_index:multiparty_ap`        = "Cultural index × MP AP"
+)
+
+# 3. Filter & relabel
+coefs_slim <- all_coefs %>%
+  filter(term %in% keep_terms) %>%
+  mutate(label = recode(term, !!!label_map))
+
+# 4. Plot
+ggplot(coefs_slim, aes(x = estimate, y = label)) +
+  geom_point(colour = "orange", size = 2) +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high),
+                 height = 0.2, colour = "orange") +
+  facet_wrap(~ model) +
+  labs(
+    x     = "Estimate (95% CI)",
+    y     = NULL,
+    title = "Figure 11. Index Coefficients From Interaction Models"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_text(size = 10),
+    strip.text  = element_text(face = "bold")
+  )
+```
+
+```{r}
+# Figure 11 re-done
+# 3. Filter, relabel, and flag significance
+coefs_slim <- all_coefs %>%
+  filter(term %in% keep_terms) %>%
+  mutate(
+    label = recode(term, !!!label_map),
+    sig   = if_else(p.value < 0.1, "Significant (p < 0.1)", "Not significant")
+  )
+
+# 4. Plot
+ggplot(coefs_slim, aes(x = estimate, y = label, colour = sig)) +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.3, colour = "grey50") +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.2) +
+  geom_point(size = 2) +
+  facet_wrap(~ model) +
+  scale_colour_manual(values = c("Not significant" = "grey60",
+                                 "Significant (p < 0.1)" = "orange")) +
+  labs(
+    x     = "Estimate (95% CI)",
+    y     = NULL,
+    title = "Figure 11. Index Coefficients From Interaction Models",
+    colour = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_text(size = 10),
+    strip.text  = element_text(face = "bold"),
+    legend.position = "bottom"
+  )
+
+```
+
+
+```{r}
+
+# 1. Define a full coef_map for both models
+coef_map_clean <- c(
+  "(Intercept)"                          = "Intercept",
+  "economic_index"                       = "Economic Index",
+  "political_index"                      = "Political Index",
+  "cultural_index"                       = "Cultural Index",
+  "partisanshipConservative"             = "Conservative ID",
+  "partisanshipGreen"                    = "Green ID",
+  "partisanshipLiberal"                  = "Liberal ID",
+  "partisanshipNDP"                      = "NDP ID",
+  "agecat30-44"                          = "Age 30–44",
+  "agecat45-59"                          = "Age 45–59",
+  "agecat60 or older"                    = "Age 60+",
+  "genderMan"                            = "Man",
+  "genderOther"                          = "Other Gender",
+  "income_catQ2"                         = "Income Q2",
+  "income_catQ3"                         = "Income Q3",
+  "income_catQ4 (high)"                  = "Income Q4 (high)",
+  "educationSome postsecondary"          = "Some Postsecondary",
+  "educationCollege diploma"             = "College Diploma",
+  "educationUniversity degree"           = "University Degree",
+  # interaction terms for the income‐cat model
+  "economic_index:income_catQ2"          = "Econ. Index × Income Q2",
+  "economic_index:income_catQ3"          = "Econ. Index × Income Q3",
+  "economic_index:income_catQ4 (high)"   = "Econ. Index × Income Q4 (high)"
+)
+
+# 2. Collect the two models
+my_models <- list(
+  "Model 2R_B"      = model_2R_B,
+  "Income Category" = model_income_cat
+)
+
+# 3. Render the table with clean names
+modelsummary(
+  my_models,
+  stars    = c("+" = 0.1, "*" = 0.05, "**" = 0.01, "***" = 0.001),
+  coef_map = coef_map_clean,
+  title    = "Table X. Comparison of Model 2R_B and Income-Category Model",
+  notes    = c(
+    "Standard errors in parentheses.",
+    "+ p<.1; * p<.05; ** p<.01; *** p<.001"
+  ),
+  output   = "income_models_table.docx"
+)
+
+```
+
+```{r}
+# 1. Tidy both models and bind into one data frame
+coef_df <- bind_rows(
+  tidy(model_2R_B, conf.int = TRUE) %>% mutate(model = "Model 2R_B"),
+  tidy(model_income_cat, conf.int = TRUE) %>% mutate(model = "Income Category")
+) %>%
+  # 2. Keep only the income‐quartile terms
+  filter(term %in% c("income_catQ2", "income_catQ3", "income_catQ4 (high)")) %>%
+  # 3. readable labels
+  mutate(
+    term = recode(term,
+      "income_catQ2"         = "Income Q2",
+      "income_catQ3"         = "Income Q3",
+      "income_catQ4 (high)"  = "Income Q4 (high)"
+    )
+  )
+
+# 4. Plot
+
+ggplot(coef_df, aes(x = estimate, y = term, color = model)) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_point(position = position_dodge(width = 0.5), size = 3) +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high),
+                 position = position_dodge(width = 0.5), height = 0.2) +
+  scale_color_discrete(
+    name   = "Model",
+    labels = c("Base Model", "Interactive Model")
+  ) +
+  labs(
+    title = "Figure 12. Income Quartile Coefficients",
+    x     = "Estimate (95% CI)",
+    y     = NULL
+  ) +
+  theme_minimal()
+```
+
+
+```{r}
+# 1. Compute marginal slopes of economic_index by income_cat
+slopes_df <- slopes(
+  model_income_cat,
+  variables = "economic_index",
+  by        = "income_cat"
+) %>%
+  # 2. Tidy up the income‐quartile labels
+  mutate(
+    income_cat = recode(
+      income_cat,
+      `income_catQ1`        = "Q1 (Lowest)",
+      `income_catQ2`        = "Q2",
+      `income_catQ3`        = "Q3",
+      `income_catQ4 (high)` = "Q4 (Highest)"
+    )
+  )
+
+# 3. Plot Figure 9
+ggplot(slopes_df, aes(x = income_cat, y = estimate)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2) +
+  labs(
+    title = "Figure 13. Marginal Effect of Economic Neglect by Income Quartile",
+    x     = "Income Quartile",
+    y     = "Marginal Effect of Economic Index\n(95% CI)"
+  ) +
+  theme_minimal()
+```
+
+
+```{r}
+# making maps
+library(sf)
+# 1. Point R at the “.shp” file in ADA Shapefile folder
+shp_path <- "/Users/bradleywood-maclean/Desktop/MA Thesis/MA_Thesis/StatsCan Shapefiles/ADA Shapefile/lada000b21a_e.shp"
+
+# 2. Read it in
+ada_sf <- st_read(shp_path, quiet = TRUE)
+
+# 3.  Transform to WGS84 for compatibility with most basemaps
+ada_sf <- st_transform(ada_sf, crs = 4326)
+
+# 4. Quick plot of all ADAs
+ggplot(ada_sf) +
+  geom_sf(fill = "white", colour = "grey60", size = 0.1) +
+  coord_sf(expand = FALSE) +
+  theme_minimal() +
+  labs(
+    title = "Canada: Aggregate Dissemination Areas",
+    subtitle = "Source: Statistics Canada ADA Shapefile",
+    x = NULL, y = NULL
+  )
+```
+
+
+
+```{r, fig.height=16}
+library(sf)
+library(lwgeom)
+library(ggplot2)
+library(patchwork)
+
+# 1. Read & reproject
+ada_sf <- st_read(
+  "/Users/bradleywood-maclean/Desktop/MA Thesis/MA_Thesis/StatsCan Shapefiles/ADA Shapefile/lada000b21a_e.shp",
+  quiet = TRUE
+) %>%
+  st_transform(4326)
+
+# 2. Repair invalid geometries
+ada_sf <- st_make_valid(ada_sf)
+
+# 3. Define new, larger ON/QC bounding box
+ontqc_bbox <- st_bbox(
+  c(xmin = -95,  # west Ontario
+    xmax = -60,  # eastern Québec
+    ymin = 42,   # goes further south
+    ymax = 48.5),  # up to northern Québec
+  crs = st_crs(ada_sf)
+)
+
+# 4.  BC bbox 
+bc_bbox <- st_bbox(
+  c(xmin = -130, xmax = -114, ymin = 48, ymax = 52),
+  crs = st_crs(ada_sf)
+)
+
+# 5. Crop
+ada_ontqc <- st_crop(ada_sf, ontqc_bbox)
+ada_bc    <- st_crop(ada_sf, bc_bbox)
+
+# 6. Themes
+base_theme <- theme_minimal(base_size = 10) +
+  theme(panel.grid = element_line(color = "grey80"),
+        axis.text = element_text(size = 7))
+
+# 7. Plots
+p_can <- ggplot(ada_sf) +
+  geom_sf(fill = "white", colour = "grey60", size = 0.1) +
+  labs(title = "Canada - Aggregate Dissemination Areas") +
+  base_theme
+
+p_ontqc <- ggplot(ada_ontqc) +
+  geom_sf(fill = "white", colour = "grey60", size = 0.1) +
+  coord_sf(
+    xlim = c(ontqc_bbox["xmin"], ontqc_bbox["xmax"]),
+    ylim = c(ontqc_bbox["ymin"], ontqc_bbox["ymax"]),
+    expand = FALSE
+  ) +
+  labs(title = "") +
+  base_theme
+
+p_bc <- ggplot(ada_bc) +
+  geom_sf(fill = "white", colour = "grey60", size = 0.1) +
+  coord_sf(
+    xlim = c(bc_bbox["xmin"], bc_bbox["xmax"]),
+    ylim = c(bc_bbox["ymin"], bc_bbox["ymax"]),
+    expand = FALSE
+  ) +
+  labs(title = "") +
+  base_theme
+
+# 8. Stack vertically
+final_map <- p_can / p_ontqc / p_bc +
+  plot_layout(ncol = 1, heights = c(1, 1, 1)) +
+  plot_annotation(
+    title    = "Canada with Insets for High-Density Regions",
+    subtitle = "Full country, southern ON/QC, Lower Mainland BC"
+  )
+
+print(final_map)
+
+
+```
+
+```{r, fig.height=16}
+# 1) Read + make valid
+ada_sf <- st_read("/Users/bradleywood-maclean/Desktop/MA Thesis/MA_Thesis/StatsCan Shapefiles/ADA Shapefile/lada000b21a_e.shp", quiet=TRUE) |>
+  st_transform(4326) |>
+  st_make_valid()
+
+# 2) Crop insets
+ada_ontqc <- st_crop(ada_sf, 
+  st_bbox(c(xmin=-95, xmax=-60, ymin=42, ymax=48.5), crs=4326)
+)
+ada_bc <- st_crop(ada_sf,
+  st_bbox(c(xmin=-130, xmax=-114, ymin=48, ymax=52), crs=4326)
+)
+
+# 3) Full Canada but clipped to 42–62°N
+p_full <- ggplot(ada_sf) +
+  geom_sf(fill="white", colour="grey60", size=0.1) +
+  coord_sf(
+    xlim   = c(-140, -50),
+    ylim   = c(42,   62),
+    expand = FALSE
+  ) +
+  labs(title = "All of Canada (42–62° N)") +
+  theme_minimal(base_size = 10) +
+  theme(panel.grid = element_line(color = "grey80"))
+
+# 4) Southern ON/QC inset
+p_ontqc <- ggplot(ada_ontqc) +
+  geom_sf(fill="white", colour="grey60", size=0.1) +
+  coord_sf(
+    xlim   = c(-95,  -60),
+    ylim   = c(42,   48.5),
+    expand = FALSE
+  ) +
+  labs(title = "Southern ON & Québec") +
+  theme_minimal(base_size = 10) +
+  theme(panel.grid = element_line(color = "grey80"))
+
+# 5) BC inset
+p_bc <- ggplot(ada_bc) +
+  geom_sf(fill="white", colour="grey60", size=0.1) +
+  coord_sf(
+    xlim   = c(-130, -114),
+    ylim   = c(48,   52),
+    expand = FALSE
+  ) +
+  labs(title = "Lower Mainland BC") +
+  theme_minimal(base_size = 10) +
+  theme(panel.grid = element_line(color = "grey80"))
+
+# 6) Stack with equal heights
+final <- p_full / p_ontqc / p_bc +
+  plot_layout(ncol = 1, heights = c(1,1,1)) +
+  plot_annotation(
+    title = "Canada with Insets for High-Density Regions",
+    subtitle = "Full country | Southern ON/QC | Lower Mainland BC"
+  )
+
+print(final)
+
+```
+
+```{r, fig.height=16}
+# 1) Read + make valid
+ada_sf <- st_read("/Users/bradleywood-maclean/Desktop/MA Thesis/MA_Thesis/StatsCan Shapefiles/ADA Shapefile/lada000b21a_e.shp", quiet=TRUE) |>
+  st_transform(4326) |>
+  st_make_valid()
+
+# 2) Crop insets
+ada_ontqc <- st_crop(ada_sf, 
+  st_bbox(c(xmin=-95, xmax=-60, ymin=42, ymax=48.5), crs=4326)
+)
+ada_bc <- st_crop(ada_sf,
+  st_bbox(c(xmin=-130, xmax=-114, ymin=48, ymax=52), crs=4326)
+)
+
+# 3) Full Canada but clipped to 42–62°N
+p_full <- ggplot(ada_sf) +
+  geom_sf(fill="white", colour="grey60", size=0.1) +
+  coord_sf(
+    xlim   = c(-140, -50),
+    ylim   = c(42,   62),
+    expand = FALSE
+  ) +
+  labs(title = "") +
+  theme_minimal(base_size = 10) +
+  theme(panel.grid = element_line(color = "grey80"))
+
+# 4) Southern ON/QC inset
+p_ontqc <- ggplot(ada_ontqc) +
+  geom_sf(fill="white", colour="grey60", size=0.1) +
+  coord_sf(
+    xlim   = c(-95,  -60),
+    ylim   = c(42,   48.5),
+    expand = FALSE
+  ) +
+  labs(title = "") +
+  theme_minimal(base_size = 10) +
+  theme(panel.grid = element_line(color = "grey80"))
+
+# 5) BC inset
+p_bc <- ggplot(ada_bc) +
+  geom_sf(fill="white", colour="grey60", size=0.1) +
+  coord_sf(
+    xlim   = c(-130, -114),
+    ylim   = c(48,   52),
+    expand = FALSE
+  ) +
+  labs(title = "") +
+  theme_minimal(base_size = 10) +
+  theme(panel.grid = element_line(color = "grey80"))
+
+# 6) Stack with equal heights
+final <- p_full / p_ontqc / p_bc +
+  plot_layout(ncol = 1, heights = c(1,1,1)) +
+  plot_annotation(
+    title = "Canada with Insets for High-Density Regions",
+  )
+
+print(final)
+```
+
+
+
+```{r}
+# 1) build an ADA-level index from survey
+ada_indices <- dat_ur_ru %>% 
+  filter(!is.na(ada_code)) %>%        # drop respondents with no ADA
+  mutate(ADAUID = as.character(ada_code)) %>%
+  group_by(ADAUID) %>%
+  summarise(
+    political_index = mean(political_index, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# 2) join onto shapefile
+ada_sf2 <- ada_sf %>% 
+  # make sure the types line up
+  mutate(ADAUID = as.character(ADAUID)) %>%
+  left_join(ada_indices, by = "ADAUID")
+
+# quick sanity-check:
+summary(ada_sf2$political_index)
+#   Min. 1st Qu.  Median    Mean 3rd Qu.    Max.    NA's 
+# -1.054  -0.819  -0.732  -0.374  -0.097   1.346     XXXX
+
+# 3) now plot the joined object, not the bare ada_sf
+ggplot(ada_sf2) +
+  geom_sf(aes(fill = political_index), colour = NA, size = 0.1) +
+  scale_fill_viridis_c(
+    option   = "viridis",
+    na.value = "grey95",
+    name     = "Political\nIndex"
+  ) +
+  coord_sf(
+    xlim   = c(-140, -50),
+    ylim   = c(42,   62),
+    expand = FALSE
+  ) +
+  labs(
+    title    = "Political Index by ADA",
+    subtitle = "Mean survey political_index per Aggregate Dissemination Area",
+    caption  = "Source: 2024 survey + Statistics Canada"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major = element_line(color = "grey80"),
+    legend.position  = "right"
+  )
+```
+
+```{r}
+n_distinct(dat_ur_ru$ada_code)  
+n_distinct(ada_sf2$ADAUID[!is.na(ada_sf2$political_index)])
+```
+
+
+```{r, fig.height=16}
+# 1) read + make valid
+ada_sf2 <- st_read(
+    "/Users/bradleywood-maclean/Desktop/MA Thesis/MA_Thesis/StatsCan Shapefiles/ADA Shapefile/lada000b21a_e.shp",
+    quiet = TRUE
+  ) |>
+  st_transform(4326) |>
+  st_make_valid()
+
+# 2) compute mean political_index per ADA *without* geometry
+ada_indices <- dat %>%
+  st_drop_geometry() %>%            # ← drop any geometry so this is a plain tibble
+  group_by(ada_code) %>%
+  summarise(political_index = mean(political_index, na.rm = TRUE)) %>%
+  ungroup() %>%
+  rename(ADAUID = ada_code)
+
+# 3) join the two
+ada_sf2 <- ada_sf2 %>%
+  left_join(ada_indices, by = "ADAUID")
+
+# 4) make the two inset crops
+ada_ontqc <- st_crop(ada_sf2,  
+  st_bbox(c(xmin = -95, xmax = -60, ymin = 42, ymax = 48.5), crs = 4326)
+)
+ada_bc <- st_crop(ada_sf2,    
+  st_bbox(c(xmin = -130, xmax = -114, ymin = 48, ymax = 52), crs = 4326)
+)
+
+# 5) full‐Canada choropleth
+p_full <- ggplot(ada_sf2) +
+  geom_sf(aes(fill = political_index), colour = NA, size = 0) +
+  scale_fill_viridis_c(
+    option   = "viridis",
+    na.value = "grey95",
+    name     = "Mean\nPol. Index"
+  ) +
+  coord_sf(xlim = c(-140, -50), ylim = c(42, 62), expand = FALSE) +
+  theme_minimal(base_size = 10) +
+  theme(
+    panel.grid       = element_line(color = "grey80"),
+    legend.position  = "right"
+  )
+
+# 6) Southern ON/QC inset
+p_ontqc <- ggplot(ada_ontqc) +
+  geom_sf(aes(fill = political_index), colour = NA, size = 0) +
+  scale_fill_viridis_c(option = "viridis", na.value = "grey95", guide = "none") +
+  coord_sf(xlim = c(-95, -60), ylim = c(42, 48.5), expand = FALSE) +
+  theme_void() +
+  theme(panel.grid = element_line(color = "grey80"))
+
+# 7) Lower Mainland BC inset
+p_bc <- ggplot(ada_bc) +
+  geom_sf(aes(fill = political_index), colour = NA, size = 0) +
+  scale_fill_viridis_c(option = "viridis", na.value = "grey95", guide = "none") +
+  coord_sf(xlim = c(-130, -114), ylim = c(48, 52), expand = FALSE) +
+  theme_void() +
+  theme(panel.grid = element_line(color = "grey80"))
+
+# 8) stack with equal widths & heights
+final_map <- (p_full / p_ontqc / p_bc) +
+  plot_layout(ncol = 1, heights = c(1,1,1), widths = 1) +
+  plot_annotation(
+    title    = "Political Index by ADA",
+  )
+
+final_map <- final_map & 
+  theme(plot.title = element_text(size = 20, face = "bold"))
+
+print(final_map)
+
+```
+
+```{r}
+n_distinct(dat$ada_code)  
+```
+
+```{r, height=16}
+# 1) read + make valid
+ada_sf2 <- st_read(
+  "/Users/bradleywood-maclean/Desktop/MA Thesis/MA_Thesis/StatsCan Shapefiles/ADA Shapefile/lada000b21a_e.shp",
+  quiet = TRUE
+) |>
+  st_transform(4326) |>
+  st_make_valid()
+
+# 2) compute mean political_index per ADA
+ada_indices <- dat %>%
+  st_drop_geometry() %>%
+  group_by(ada_code) %>%
+  summarise(political_index = mean(political_index, na.rm = TRUE)) %>%
+  ungroup() %>%
+  rename(ADAUID = ada_code)
+
+# 3) join the two
+ada_sf2 <- ada_sf2 %>%
+  left_join(ada_indices, by = "ADAUID")
+
+# 4) make all crops: national, two big insets, plus three city insets
+ada_full    <- ada_sf2
+ada_ontqc   <- st_crop(ada_sf2, st_bbox(c(xmin=-95,  xmax=-60,   ymin=42,   ymax=48.5), crs=4326))
+ada_bc      <- st_crop(ada_sf2, st_bbox(c(xmin=-130, xmax=-114,  ymin=48,   ymax=52),   crs=4326))
+
+ada_toronto   <- st_crop(ada_sf2, st_bbox(c(xmin=-80.7, xmax=-79,    ymin=43.5, ymax=44),   crs=4326))
+ada_montreal  <- st_crop(ada_sf2, st_bbox(c(xmin=-74,   xmax=-71,    ymin=45,   ymax=46),   crs=4326))
+ada_vancouver <- st_crop(ada_sf2, st_bbox(c(xmin=-123.5,xmax=-122,   ymin=49,    ymax=49.5), crs=4326))
+
+# 5) define a shared fill scale
+fill_scale <- scale_fill_viridis_c(
+  option   = "viridis",
+  na.value = "grey95",
+  name     = "Mean\nPol. Index"
+)
+
+# 6) full‐Canada choropleth
+p_full <- ggplot(ada_full) +
+  geom_sf(aes(fill = political_index),
+          colour = "black",    # ← black borders for everything
+          size   = 0.15) +
+  fill_scale +
+  coord_sf(xlim = c(-140, -50), ylim = c(42, 62), expand = FALSE) +
+  theme_minimal(base_size = 10) +
+  theme(
+    panel.grid      = element_line(color = "grey80"),
+    legend.position = "right"
+  )
+
+# 7) Southern ON/QC inset
+p_ontqc <- ggplot(ada_ontqc) +
+  geom_sf(aes(fill = political_index),
+          colour = "black", size = 0.1) +
+  fill_scale +                     # same palette, no legend
+  guides(fill = "none") +
+  coord_sf(xlim   = c(-95,  -60),
+           ylim   = c(42,   48.5),
+           expand = FALSE) +
+  theme_void() +
+  theme(panel.grid = element_line(color = "grey80"))
+
+# 8) Lower Mainland BC inset
+p_bc <- ggplot(ada_bc) +
+  geom_sf(aes(fill = political_index),
+          colour = "black", size = 0.1) +
+  fill_scale +
+  guides(fill = "none") +
+  coord_sf(xlim   = c(-130, -114),
+           ylim   = c(48,   52),
+           expand = FALSE) +
+  theme_void() +
+  theme(panel.grid = element_line(color = "grey80"))
+
+# 9) Toronto / Montréal / Vancouver insets
+p_toronto <- ggplot(ada_toronto) +
+  geom_sf(aes(fill = political_index),
+          colour = "black", size = 0.1) +
+  fill_scale +
+  guides(fill = "none") +
+  coord_sf(xlim   = c(-80, -79),
+           ylim   = c(43.5, 44),
+           expand = FALSE) +
+  theme_void() +
+  theme(panel.grid = element_line(color = "grey80"))
+
+p_montreal <- ggplot(ada_montreal) +
+  geom_sf(aes(fill = political_index),
+          colour = "black", size = 0.1) +
+  fill_scale +
+  guides(fill = "none") +
+  coord_sf(xlim   = c(-74, -71),
+           ylim   = c(45,   46),
+           expand = FALSE) +
+  theme_void() +
+  theme(panel.grid = element_line(color = "grey80"))
+
+p_vancouver <- ggplot(ada_vancouver) +
+  geom_sf(aes(fill = political_index),
+          colour = "black", size = 0.1) +
+  fill_scale +
+  guides(fill = "none") +
+  coord_sf(xlim   = c(-123.5, -122),
+           ylim   = c(49,      49.5),
+           expand = FALSE) +
+  theme_void() +
+  theme(panel.grid = element_line(color = "grey80"))
+
+# 10) final patchwork layout
+layout <- "
+AAA
+BBB
+CCC
+DEF
+"
+
+final_map <- p_full     +
+             p_ontqc    +
+             p_bc       +
+             p_toronto  +
+             p_montreal +
+             p_vancouver +
+  plot_layout(
+    design  = layout,
+    heights = c(1,1,1,1),
+    widths  = c(1,1,1)
+  ) +
+  plot_annotation(
+    title = "Political Index by ADA"
+  ) & 
+  theme(plot.title = element_text(size = 20, face = "bold"))
+
+print(final_map)
+
+```
+```{r}
+library(patchwork)
+
+# Add legend only to full Canada
+p_full_leg  <- p_full + theme(legend.position = "right")
+p_ontqc_no  <- p_ontqc + guides(fill = "none")
+p_bc_no     <- p_bc + guides(fill = "none")
+p_toronto_no   <- p_toronto + guides(fill = "none")
+p_montreal_no  <- p_montreal + guides(fill = "none")
+p_vancouver_no <- p_vancouver + guides(fill = "none")
+
+
+# Layout string (Canada wide, then 2x3 insets)
+layout <- "
+AAA
+BCD
+EFG
+"
+
+final_map <- (
+  p_full_leg +
+  p_ontqc_no +
+  p_bc_no +
+  p_toronto_no +
+  p_montreal_no +
+  p_vancouver_no +
+  plot_spacer()
+) +
+  plot_layout(
+    design = layout,
+    heights = c(1.5, 1, 1),   # make the Canada map taller
+    widths = c(1, 1, 1)
+  ) +
+  plot_annotation(
+    title = "Political Index by ADA"
+  ) & 
+  theme(plot.title = element_text(size = 20, face = "bold"))
+
+print(final_map)
+```
+
+```{r, fig.height=16}
+# 1) read + make valid
+ada_sf2 <- st_read(
+  "/Users/bradleywood-maclean/Desktop/MA Thesis/MA_Thesis/StatsCan Shapefiles/ADA Shapefile/lada000b21a_e.shp",
+  quiet = TRUE
+) |>
+  st_transform(4326) |>
+  st_make_valid()
+
+# 2) compute mean political_index per ADA
+ada_indices <- dat %>%
+  st_drop_geometry() %>%
+  group_by(ada_code) %>%
+  summarise(political_index = mean(political_index, na.rm = TRUE)) %>%
+  ungroup() %>%
+  rename(ADAUID = ada_code)
+
+# 3) join the two
+ada_sf2 <- ada_sf2 %>%
+  left_join(ada_indices, by = "ADAUID")
+
+# 4) make all crops: national, two big insets, plus three city insets
+ada_full    <- ada_sf2
+
+ada_ontqc <- st_crop(
+  ada_sf2,
+  st_bbox(c(xmin = -79.7, xmax = -72.5, ymin = 43.2, ymax = 46.5), crs = 4326)
+)
+
+ada_bc      <- st_crop(ada_sf2, st_bbox(c(xmin=-130, xmax=-114,  ymin=48,   ymax=52),   crs=4326))
+
+ada_toronto <- st_crop(
+  ada_sf2,
+  st_bbox(c(xmin = -79.65, xmax = -79.1, ymin = 43.55, ymax = 43.85), crs = 4326)
+)
+
+ada_montreal <- st_crop(
+  ada_sf2,
+  st_bbox(c(xmin = -73.9, xmax = -73.3, ymin = 45.35, ymax = 45.7), crs = 4326)
+)
+
+ada_vancouver <- st_crop(
+  ada_sf2,
+  st_bbox(c(xmin = -123.25, xmax = -123.0, ymin = 49.20, ymax = 49.32), crs = 4326)
+)
+
+ada_ab_corridor <- st_crop(
+  ada_sf2,
+  st_bbox(c(
+    xmin = -115.2, xmax = -113.2,
+    ymin = 51.0,  ymax = 54.0
+  ), crs = 4326)
+)
+
+# 5) define a shared fill scale
+fill_scale <- scale_fill_viridis_c(
+  option   = "viridis",
+  na.value = "grey95",
+  name     = "Mean\nPol. Index"
+)
+
+# 6) full‐Canada choropleth
+p_full <- ggplot(ada_full) +
+  geom_sf(aes(fill = political_index),
+          colour = "grey",    # ← black borders for everything
+          size   = 0.15) +
+  fill_scale +
+  coord_sf(xlim = c(-140, -50), ylim = c(42, 62), expand = FALSE) +
+  theme_minimal(base_size = 10) +
+  theme(
+    panel.grid      = element_line(color = "grey80"),
+    legend.position = "right"
+  )
+
+# 7) Southern ON/QC inset
+p_ontqc <- ggplot(ada_ontqc) +
+  geom_sf(aes(fill = political_index),
+          colour = "grey", size = 0.1) +
+  fill_scale +
+  guides(fill = "none") +
+  coord_sf(
+    xlim = c(-79.7, -72.5),
+    ylim = c(43.2, 46.5),
+    expand = FALSE
+  ) +
+  theme_void() +
+  ggtitle("Sounthern ON/QC")+
+  theme(panel.grid = element_line(color = "grey80"),
+        plot.title = element_text(hjust = 0.5))
+
+# 8) Lower Mainland BC inset
+p_bc <- ggplot(ada_bc) +
+  geom_sf(aes(fill = political_index),
+          colour = "grey", size = 0.1) +
+  fill_scale +
+  guides(fill = "none") +
+  coord_sf(xlim   = c(-130, -114),
+           ylim   = c(48,   52),
+           expand = FALSE) +
+  theme_void() +
+  ggtitle("Lower Mainland") +
+  theme(panel.grid = element_line(color = "grey80"),
+        plot.title = element_text(hjust = 0.5))
+
+# 9) Toronto / Montréal / Vancouver insets
+p_toronto <- ggplot(ada_toronto) +
+  geom_sf(aes(fill = political_index), colour = "grey", size = 0.1) +
+  fill_scale +
+  guides(fill = "none") +
+  coord_sf(
+    xlim = c(-79.65, -79.1),
+    ylim = c(43.55, 43.85),
+    expand = FALSE
+  ) +
+  theme_void() +
+  ggtitle("Toronto") +
+  theme(panel.grid = element_line(color = "grey80"),
+        plot.title = element_text(hjust = 0.5))
+
+
+p_montreal <- ggplot(ada_montreal) +
+  geom_sf(aes(fill = political_index),
+          colour = "grey", size = 0.1) +
+  fill_scale +
+  guides(fill = "none") +
+  coord_sf(
+    xlim = c(-73.9, -73.3),
+    ylim = c(45.35, 45.7),
+    expand = FALSE
+  ) +
+  theme_void() +
+  ggtitle("Montreal") +
+  theme(panel.grid = element_line(color = "grey80"),
+        plot.title = element_text(hjust = 0.5))
+
+p_vancouver <- ggplot(ada_vancouver) +
+  geom_sf(aes(fill = political_index), colour = "grey", size = 0.1) +
+  fill_scale +
+  guides(fill = "none") +
+  coord_sf(
+    xlim = c(-123.25, -123.0),
+    ylim = c(49.20, 49.32),
+    expand = FALSE
+  ) +
+  theme_void() +
+  ggtitle("Vancouver")+
+  theme(panel.grid = element_line(color = "grey80"),
+        plot.title = element_text(hjust = 0.5))
+
+p_ab_corridor <- ggplot(ada_ab_corridor) +
+  geom_sf(aes(fill = political_index), colour = "grey", size = 0.1) +
+  fill_scale +
+  guides(fill = "none") +
+  coord_sf(
+    xlim = c(-115.2, -113.2),
+    ylim = c(51.0, 54.0),
+    expand = FALSE
+  ) +
+  theme_void() +
+  ggtitle("Edmonton-Calgary Corridor")+
+  theme(panel.grid = element_line(color = "grey80"),
+        plot.title = element_text(hjust = 0.5))
+
+# Add legend only to full Canada
+p_full_leg  <- p_full + theme(legend.position = "right")
+p_ontqc_no  <- p_ontqc + guides(fill = "none")
+p_bc_no     <- p_bc + guides(fill = "none")
+p_toronto_no   <- p_toronto + guides(fill = "none")
+p_montreal_no  <- p_montreal + guides(fill = "none")
+p_vancouver_no <- p_vancouver + guides(fill = "none")
+
+
+# Layout string (Canada wide, then 2x3 insets)
+layout <- "
+AAAAA
+BBDEG
+CCCFG
+"
+
+final_map <- (
+  p_full_leg +   # A
+  p_ontqc +      # B
+  p_bc +         # C
+  p_toronto +    # D
+  p_montreal +   # E
+  p_vancouver +  # F
+  p_ab_corridor +# G (Calgary-Edmonton)
+  plot_spacer() +# H (empty)
+  plot_spacer()  # I (empty)
+) +
+  plot_layout(
+    design = layout,
+    heights = c(1.5, 1, 1),
+    widths = c(1, 1, 1, 1)
+  ) +
+  plot_annotation(
+    title = "Figure 2. Political Index by ADA"
+  ) &
+  theme(plot.title = element_text(size = 30, face = "bold"))
+
+print(final_map)
+```
+
+```{r, fig.height=16}
+# Economic index
+# 1) read + make valid
+ada_sf2 <- st_read(
+  "/Users/bradleywood-maclean/Desktop/MA Thesis/MA_Thesis/StatsCan Shapefiles/ADA Shapefile/lada000b21a_e.shp",
+  quiet = TRUE
+) |>
+  st_transform(4326) |>
+  st_make_valid()
+
+# 2) compute mean economic_index per ADA
+ada_indices <- dat %>%
+  st_drop_geometry() %>%
+  group_by(ada_code) %>%
+  summarise(economic_index = mean(economic_index, na.rm = TRUE)) %>%
+  ungroup() %>%
+  rename(ADAUID = ada_code)
+
+# 3) join the two
+ada_sf2 <- ada_sf2 %>%
+  left_join(ada_indices, by = "ADAUID")
+
+# 4) make all crops: national, two big insets, plus three city insets
+ada_full    <- ada_sf2
+
+ada_ontqc <- st_crop(
+  ada_sf2,
+  st_bbox(c(xmin = -79.7, xmax = -72.5, ymin = 43.2, ymax = 46.5), crs = 4326)
+)
+
+ada_bc      <- st_crop(ada_sf2, st_bbox(c(xmin=-130, xmax=-114,  ymin=48,   ymax=52),   crs=4326))
+
+ada_toronto <- st_crop(
+  ada_sf2,
+  st_bbox(c(xmin = -79.65, xmax = -79.1, ymin = 43.55, ymax = 43.85), crs = 4326)
+)
+
+ada_montreal <- st_crop(
+  ada_sf2,
+  st_bbox(c(xmin = -73.9, xmax = -73.3, ymin = 45.35, ymax = 45.7), crs = 4326)
+)
+
+ada_vancouver <- st_crop(
+  ada_sf2,
+  st_bbox(c(xmin = -123.25, xmax = -123.0, ymin = 49.20, ymax = 49.32), crs = 4326)
+)
+
+ada_ab_corridor <- st_crop(
+  ada_sf2,
+  st_bbox(c(
+    xmin = -115.2, xmax = -113.2,
+    ymin = 51.0,  ymax = 54.0
+  ), crs = 4326)
+)
+
+# 5) define a shared fill scale
+fill_scale <- scale_fill_viridis_c(
+  option   = "viridis",
+  na.value = "grey95",
+  name     = "Mean\nEcon. Index"
+)
+
+# 6) full‐Canada choropleth
+p_full <- ggplot(ada_full) +
+  geom_sf(aes(fill = economic_index),
+          colour = "grey",    # ← black borders for everything
+          size   = 0.15) +
+  fill_scale +
+  coord_sf(xlim = c(-140, -50), ylim = c(42, 62), expand = FALSE) +
+  theme_minimal(base_size = 10) +
+  theme(
+    panel.grid      = element_line(color = "grey80"),
+    legend.position = "right"
+  )
+
+# 7) Southern ON/QC inset
+p_ontqc <- ggplot(ada_ontqc) +
+  geom_sf(aes(fill = economic_index),
+          colour = "grey", size = 0.1) +
+  fill_scale +
+  guides(fill = "none") +
+  coord_sf(
+    xlim = c(-79.7, -72.5),
+    ylim = c(43.2, 46.5),
+    expand = FALSE
+  ) +
+  theme_void() +
+  ggtitle("Sounthern ON/QC")+
+  theme(panel.grid = element_line(color = "grey80"),
+        plot.title = element_text(hjust = 0.5))
+
+# 8) Lower Mainland BC inset
+p_bc <- ggplot(ada_bc) +
+  geom_sf(aes(fill = economic_index),
+          colour = "grey", size = 0.1) +
+  fill_scale +
+  guides(fill = "none") +
+  coord_sf(xlim   = c(-130, -114),
+           ylim   = c(48,   52),
+           expand = FALSE) +
+  theme_void() +
+  ggtitle("Lower Mainland") +
+  theme(panel.grid = element_line(color = "grey80"),
+        plot.title = element_text(hjust = 0.5))
+
+# 9) Toronto / Montréal / Vancouver insets
+p_toronto <- ggplot(ada_toronto) +
+  geom_sf(aes(fill = economic_index), colour = "grey", size = 0.1) +
+  fill_scale +
+  guides(fill = "none") +
+  coord_sf(
+    xlim = c(-79.65, -79.1),
+    ylim = c(43.55, 43.85),
+    expand = FALSE
+  ) +
+  theme_void() +
+  ggtitle("Toronto") +
+  theme(panel.grid = element_line(color = "grey80"),
+        plot.title = element_text(hjust = 0.5))
+
+
+p_montreal <- ggplot(ada_montreal) +
+  geom_sf(aes(fill = economic_index),
+          colour = "grey", size = 0.1) +
+  fill_scale +
+  guides(fill = "none") +
+  coord_sf(
+    xlim = c(-73.9, -73.3),
+    ylim = c(45.35, 45.7),
+    expand = FALSE
+  ) +
+  theme_void() +
+  ggtitle("Montreal") +
+  theme(panel.grid = element_line(color = "grey80"),
+        plot.title = element_text(hjust = 0.5))
+
+p_vancouver <- ggplot(ada_vancouver) +
+  geom_sf(aes(fill = economic_index), colour = "grey", size = 0.1) +
+  fill_scale +
+  guides(fill = "none") +
+  coord_sf(
+    xlim = c(-123.25, -123.0),
+    ylim = c(49.20, 49.32),
+    expand = FALSE
+  ) +
+  theme_void() +
+  ggtitle("Vancouver")+
+  theme(panel.grid = element_line(color = "grey80"),
+        plot.title = element_text(hjust = 0.5))
+
+p_ab_corridor <- ggplot(ada_ab_corridor) +
+  geom_sf(aes(fill = economic_index), colour = "grey", size = 0.1) +
+  fill_scale +
+  guides(fill = "none") +
+  coord_sf(
+    xlim = c(-115.2, -113.2),
+    ylim = c(51.0, 54.0),
+    expand = FALSE
+  ) +
+  theme_void() +
+  ggtitle("Edmonton-Calgary Corridor")+
+  theme(panel.grid = element_line(color = "grey80"),
+        plot.title = element_text(hjust = 0.5))
+
+# Add legend only to full Canada
+p_full_leg  <- p_full + theme(legend.position = "right")
+p_ontqc_no  <- p_ontqc + guides(fill = "none")
+p_bc_no     <- p_bc + guides(fill = "none")
+p_toronto_no   <- p_toronto + guides(fill = "none")
+p_montreal_no  <- p_montreal + guides(fill = "none")
+p_vancouver_no <- p_vancouver + guides(fill = "none")
+
+
+# Layout string (Canada wide, then 2x3 insets)
+layout <- "
+AAAAA
+BBDEG
+CCCFG
+"
+
+final_map <- (
+  p_full_leg +   # A
+  p_ontqc +      # B
+  p_bc +         # C
+  p_toronto +    # D
+  p_montreal +   # E
+  p_vancouver +  # F
+  p_ab_corridor +# G (Calgary-Edmonton)
+  plot_spacer() +# H (empty)
+  plot_spacer()  # I (empty)
+) +
+  plot_layout(
+    design = layout,
+    heights = c(1.5, 1, 1),
+    widths = c(1, 1, 1, 1)
+  ) +
+  plot_annotation(
+    title = "Figure 4. Economic Index by ADA"
+  ) &
+  theme(plot.title = element_text(size = 30, face = "bold"))
+
+print(final_map)
+```
+
+```{r, fig.height=16}
+# Cultural index
+# 1) read + make valid
+ada_sf2 <- st_read(
+  "/Users/bradleywood-maclean/Desktop/MA Thesis/MA_Thesis/StatsCan Shapefiles/ADA Shapefile/lada000b21a_e.shp",
+  quiet = TRUE
+) |>
+  st_transform(4326) |>
+  st_make_valid()
+
+# 2) compute mean economic_index per ADA
+ada_indices <- dat %>%
+  st_drop_geometry() %>%
+  group_by(ada_code) %>%
+  summarise(cultural_index = mean(cultural_index, na.rm = TRUE)) %>%
+  ungroup() %>%
+  rename(ADAUID = ada_code)
+
+# 3) join the two
+ada_sf2 <- ada_sf2 %>%
+  left_join(ada_indices, by = "ADAUID")
+
+# 4) make all crops: national, two big insets, plus three city insets
+ada_full    <- ada_sf2
+
+ada_ontqc <- st_crop(
+  ada_sf2,
+  st_bbox(c(xmin = -79.7, xmax = -72.5, ymin = 43.2, ymax = 46.5), crs = 4326)
+)
+
+ada_bc      <- st_crop(ada_sf2, st_bbox(c(xmin=-130, xmax=-114,  ymin=48,   ymax=52),   crs=4326))
+
+ada_toronto <- st_crop(
+  ada_sf2,
+  st_bbox(c(xmin = -79.65, xmax = -79.1, ymin = 43.55, ymax = 43.85), crs = 4326)
+)
+
+ada_montreal <- st_crop(
+  ada_sf2,
+  st_bbox(c(xmin = -73.9, xmax = -73.3, ymin = 45.35, ymax = 45.7), crs = 4326)
+)
+
+ada_vancouver <- st_crop(
+  ada_sf2,
+  st_bbox(c(xmin = -123.25, xmax = -123.0, ymin = 49.20, ymax = 49.32), crs = 4326)
+)
+
+ada_ab_corridor <- st_crop(
+  ada_sf2,
+  st_bbox(c(
+    xmin = -115.2, xmax = -113.2,
+    ymin = 51.0,  ymax = 54.0
+  ), crs = 4326)
+)
+
+# 5) define a shared fill scale
+fill_scale <- scale_fill_viridis_c(
+  option   = "viridis",
+  na.value = "grey95",
+  name     = "Mean\nCultural Index"
+)
+
+# 6) full‐Canada choropleth
+p_full <- ggplot(ada_full) +
+  geom_sf(aes(fill = cultural_index),
+          colour = "grey",    # ← black borders for everything
+          size   = 0.15) +
+  fill_scale +
+  coord_sf(xlim = c(-140, -50), ylim = c(42, 62), expand = FALSE) +
+  theme_minimal(base_size = 10) +
+  theme(
+    panel.grid      = element_line(color = "grey80"),
+    legend.position = "right"
+  )
+
+# 7) Southern ON/QC inset
+p_ontqc <- ggplot(ada_ontqc) +
+  geom_sf(aes(fill = cultural_index),
+          colour = "grey", size = 0.1) +
+  fill_scale +
+  guides(fill = "none") +
+  coord_sf(
+    xlim = c(-79.7, -72.5),
+    ylim = c(43.2, 46.5),
+    expand = FALSE
+  ) +
+  theme_void() +
+  ggtitle("Sounthern ON/QC")+
+  theme(panel.grid = element_line(color = "grey80"),
+        plot.title = element_text(hjust = 0.5))
+
+# 8) Lower Mainland BC inset
+p_bc <- ggplot(ada_bc) +
+  geom_sf(aes(fill = cultural_index),
+          colour = "grey", size = 0.1) +
+  fill_scale +
+  guides(fill = "none") +
+  coord_sf(xlim   = c(-130, -114),
+           ylim   = c(48,   52),
+           expand = FALSE) +
+  theme_void() +
+  ggtitle("Lower Mainland") +
+  theme(panel.grid = element_line(color = "grey80"),
+        plot.title = element_text(hjust = 0.5))
+
+# 9) Toronto / Montréal / Vancouver insets
+p_toronto <- ggplot(ada_toronto) +
+  geom_sf(aes(fill = cultural_index), colour = "grey", size = 0.1) +
+  fill_scale +
+  guides(fill = "none") +
+  coord_sf(
+    xlim = c(-79.65, -79.1),
+    ylim = c(43.55, 43.85),
+    expand = FALSE
+  ) +
+  theme_void() +
+  ggtitle("Toronto") +
+  theme(panel.grid = element_line(color = "grey80"),
+        plot.title = element_text(hjust = 0.5))
+
+
+p_montreal <- ggplot(ada_montreal) +
+  geom_sf(aes(fill = cultural_index),
+          colour = "grey", size = 0.1) +
+  fill_scale +
+  guides(fill = "none") +
+  coord_sf(
+    xlim = c(-73.9, -73.3),
+    ylim = c(45.35, 45.7),
+    expand = FALSE
+  ) +
+  theme_void() +
+  ggtitle("Montreal") +
+  theme(panel.grid = element_line(color = "grey80"),
+        plot.title = element_text(hjust = 0.5))
+
+p_vancouver <- ggplot(ada_vancouver) +
+  geom_sf(aes(fill = cultural_index), colour = "grey", size = 0.1) +
+  fill_scale +
+  guides(fill = "none") +
+  coord_sf(
+    xlim = c(-123.25, -123.0),
+    ylim = c(49.20, 49.32),
+    expand = FALSE
+  ) +
+  theme_void() +
+  ggtitle("Vancouver")+
+  theme(panel.grid = element_line(color = "grey80"),
+        plot.title = element_text(hjust = 0.5))
+
+p_ab_corridor <- ggplot(ada_ab_corridor) +
+  geom_sf(aes(fill = cultural_index), colour = "grey", size = 0.1) +
+  fill_scale +
+  guides(fill = "none") +
+  coord_sf(
+    xlim = c(-115.2, -113.2),
+    ylim = c(51.0, 54.0),
+    expand = FALSE
+  ) +
+  theme_void() +
+  ggtitle("Edmonton-Calgary Corridor")+
+  theme(panel.grid = element_line(color = "grey80"),
+        plot.title = element_text(hjust = 0.5))
+
+# Add legend only to full Canada
+p_full_leg  <- p_full + theme(legend.position = "right")
+p_ontqc_no  <- p_ontqc + guides(fill = "none")
+p_bc_no     <- p_bc + guides(fill = "none")
+p_toronto_no   <- p_toronto + guides(fill = "none")
+p_montreal_no  <- p_montreal + guides(fill = "none")
+p_vancouver_no <- p_vancouver + guides(fill = "none")
+
+
+# Layout string (Canada wide, then 2x3 insets)
+layout <- "
+AAAAA
+BBDEG
+CCCFG
+"
+
+final_map <- (
+  p_full_leg +   # A
+  p_ontqc +      # B
+  p_bc +         # C
+  p_toronto +    # D
+  p_montreal +   # E
+  p_vancouver +  # F
+  p_ab_corridor +# G (Calgary-Edmonton)
+  plot_spacer() +# H (empty)
+  plot_spacer()  # I (empty)
+) +
+  plot_layout(
+    design = layout,
+    heights = c(1.5, 1, 1),
+    widths = c(1, 1, 1, 1)
+  ) +
+  plot_annotation(
+    title = "Figure 6. Cultural Index by ADA"
+  ) &
+  theme(plot.title = element_text(size = 30, face = "bold"))
+
+print(final_map)
+```
+

@@ -1,0 +1,1104 @@
+---
+title: "5_STM"
+author: "Brad Wood-MacLean"
+date: "2025-06-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "/Users/bradleywood-maclean/Desktop/MA Thesis/MA_Thesis/")
+# 1) Force Cairo-based PNG (no QuartzBitmap)
+options(bitmapType = "cairo")  
+
+# 2) Tell knitr to use png+Cairo and save figures in "figures/"
+knitr::opts_chunk$set(
+  dev       = "png",
+  dev.args  = list(type = "cairo"),
+  fig.path  = "figures/"
+)
+
+# 3) Close any lingering Quartz devices
+graphics.off()
+library(tidyverse)
+library(readr)
+library(sf)
+library(dplyr)
+library(stringr)
+library(knitr)
+library(tibble)
+library(scales)
+library(rio)
+library(purrr)
+library(forcats)
+library(tidytext)
+library(stopwords)
+library(textdata)
+library(Matrix)
+library(widyr)
+library(stm)
+library(furrr)
+library(BTM)
+library(tokenizers)
+library(broom)
+library(cld3)
+library(stringi)
+set.seed(123)
+```
+
+```{r}
+# load the cleaned up data from last time 
+dat <- readRDS("dat3.rds")
+
+# make an unified resentment variable so that urban and rural respondents can be in a single regression
+dat <- dat %>%
+  mutate(
+    unified_resentment = coalesce(rural_resentment, urban_resentment)
+  )
+
+```
+
+```{r}
+# STM
+# export to translate
+dat_export <- dat %>%
+  st_drop_geometry() %>%  # drop spatial geometry
+  mutate(row_id = row_number()) %>%
+  select(row_id, response_id, placetype_open_urban, placetype_open_rural) %>%
+  filter(!is.na(placetype_open_urban) | !is.na(placetype_open_rural))
+
+# write.csv(dat_export, "open_ends_urban_rural_manual_review.csv", row.names = FALSE)
+# make sure everything got exported
+dat %>%
+  st_drop_geometry() %>%
+  summarise(
+    n_total = n(),
+    missing_response_id = sum(is.na(response_id) | response_id == ""),
+    missing_urban = sum(is.na(placetype_open_urban) | placetype_open_urban == ""),
+    missing_rural = sum(is.na(placetype_open_rural) | placetype_open_rural == ""),
+    both_missing_or_blank = sum(
+      (is.na(placetype_open_urban) | placetype_open_urban == "") &
+      (is.na(placetype_open_rural) | placetype_open_rural == "")
+    )
+  )
+
+```
+
+
+```{r}
+dat_export %>%
+  summarise(
+    n_total = n(),
+    missing_response_id = sum(is.na(response_id) | response_id == ""),
+    missing_urban = sum(is.na(placetype_open_urban) | placetype_open_urban == ""),
+    missing_rural = sum(is.na(placetype_open_rural) | placetype_open_rural == ""),
+    both_missing_or_blank = sum(
+      (is.na(placetype_open_urban) | placetype_open_urban == "") &
+      (is.na(placetype_open_rural) | placetype_open_rural == "")
+    )
+  )
+```
+
+```{r}
+# merge in the translated one
+cleaned <- read.csv("open_ends_urban_rural_manual_review.csv", stringsAsFactors = FALSE)
+
+dat$response_id <- as.character(dat$response_id)
+cleaned$response_id <- as.character(cleaned$response_id)
+
+dat <- dat %>%
+  select(-placetype_open_urban, -placetype_open_rural) %>%  # remove original versions
+  left_join(
+    cleaned %>%
+      select(response_id, placetype_open_urban, placetype_open_rural),
+    by = "response_id"
+  )
+```
+
+```{r}
+# Checking who actually answered which open-ended questions:
+# keep in mind, NAs are not used for these instead the cell is just blank
+dat %>%
+  # 1. Ensure open‐ended fields are valid UTF-8 
+  mutate(
+    clean_urban = iconv(placetype_open_urban, from = "", to = "UTF-8", sub = ""),
+    clean_rural = iconv(placetype_open_rural, from = "", to = "UTF-8", sub = "")
+  ) %>%
+  # 2. Group by the existing placetype_best factor 
+  group_by(placetype_best) %>%
+  summarise(
+    n_total = n(),
+    # Count non‐blank urban responses (not NA and, after trimming, not "")
+    n_answered_urban = sum(
+      !is.na(clean_urban) & str_trim(clean_urban) != ""
+    ),
+    # Count non‐blank rural responses (not NA and, after trimming, not "")
+    n_answered_rural = sum(
+      !is.na(clean_rural) & str_trim(clean_rural) != ""
+    ),
+    .groups = "drop"
+  )
+```
+
+
+## Rural
+
+- DV: rural opinions
+- Respondents: urban, rural
+- Control variables: partisanship, placetype, unified_resentment, political_index, economic_index, cultural_index,  
+    remoteness_index, partisan_affective_polarization
+    
+```{r}
+# --- STM ON RURAL OPEN‐ENDED RESPONSES WITH ALL COVARIATES ---
+#
+# DV: placetype_open_rural (“rural opinions”)
+# Respondents: only those in Urban or Rural (exclude Suburban)
+# Controls: 
+#   • partisanship                    (categorical)
+#   • placetype_best                  (Urban vs. Rural)
+#   • unified_resentment              (numeric)
+#   • political_index                 (numeric)
+#   • economic_index                  (numeric)
+#   • cultural_index                  (numeric)
+#   • remoteness_index                (numeric)
+#   • partisan_affective_polarization (numeric)
+
+# 1. Build a data frame of rural open‐ended responses with UTF‐8 cleaning,
+#    filtering to Urban & Rural respondents and ensuring all covariates are present.
+rural_fullcov_df <- dat %>%
+  filter(placetype_best %in% c("Urban", "Rural")) %>%
+  mutate(
+    # Convert to UTF‐8 (drop malformed bytes) and trim whitespace
+    clean_rural = iconv(placetype_open_rural, from = "", to = "UTF-8", sub = ""),
+    clean_rural = str_trim(clean_rural)
+  ) %>%
+  filter(
+    # Keep only non‐blank text and non‐missing covariates
+    !is.na(clean_rural),
+    clean_rural != "",
+    !is.na(partisanship),
+    !is.na(unified_resentment),
+    !is.na(political_index),
+    !is.na(economic_index),
+    !is.na(cultural_index),
+    !is.na(remoteness_index),
+    !is.na(partisan_affective_polarization)
+  ) %>%
+  mutate(
+    doc_id = row_number(),
+    text   = clean_rural
+  ) %>%
+  select(
+    doc_id,
+    text,
+    partisanship,
+    placetype_best,
+    unified_resentment,
+    political_index,
+    economic_index,
+    cultural_index,
+    remoteness_index,
+    partisan_affective_polarization
+  )
+
+# 2. Preprocess text with STM’s built‐in pipeline
+proc_rural_fullcov <- textProcessor(
+  documents = rural_fullcov_df$text,
+  metadata  = rural_fullcov_df
+)
+
+prep_rural_fullcov <- prepDocuments(
+  documents    = proc_rural_fullcov$documents,
+  vocab        = proc_rural_fullcov$vocab,
+  meta         = proc_rural_fullcov$meta,
+  lower.thresh = 1
+)
+
+# 3. Fit an STM with prevalence ~ partisanship + placetype_best +
+#    unified_resentment + political_index + economic_index + cultural_index +
+#    remoteness_index + partisan_affective_polarization
+stm_rural_fullcov_k15 <- stm(
+  documents  = prep_rural_fullcov$documents,
+  vocab      = prep_rural_fullcov$vocab,
+  K          = 15,
+  prevalence = ~ partisanship + placetype_best +
+                 unified_resentment + political_index +
+                 economic_index + cultural_index + remoteness_index +
+                 partisan_affective_polarization,
+  data       = prep_rural_fullcov$meta,
+  verbose    = TRUE
+)
+
+# 4. Inspect topic labels and overall summary
+labelTopics(stm_rural_fullcov_k15, n = 7)
+summary(stm_rural_fullcov_k15)
+plot(stm_rural_fullcov_k15, type = "summary", n = 10)
+
+# 5. Estimate covariate effects for all topics
+effect_rural_fullcov <- estimateEffect(
+  1:15 ~ partisanship + placetype_best +
+         unified_resentment + political_index +
+         economic_index + cultural_index + remoteness_index +
+         partisan_affective_polarization,
+  stmobj    = stm_rural_fullcov_k15,
+  metadata  = prep_rural_fullcov$meta,
+  uncertainty = "Global"
+)
+
+# 6. plots:
+
+#   (a) Continuous effect of partisan_affective_polarization on Topic 8
+plot(
+  effect_rural_fullcov,
+  covariate = "partisan_affective_polarization",
+  topics    = 8,
+  model     = stm_rural_fullcov_k15,
+  method    = "continuous",
+  xlab      = "Partisan Affective Polarization (therm difference)",
+  main      = "Topic 8 prevalence by Partisan Polarization"
+)
+
+#   (b) Continuous effect of remoteness_index on Topic 6
+plot(
+  effect_rural_fullcov,
+  covariate = "remoteness_index",
+  topics    = 6,
+  model     = stm_rural_fullcov_k15,
+  method    = "continuous",
+  xlab      = "Remoteness Index",
+  main      = "Topic 6 prevalence by Remoteness Index"
+)
+
+#   (c) Difference in Topic 5 prevalence: Rural vs. Urban
+plot(
+  effect_rural_fullcov,
+  covariate  = "placetype_best",
+  topics     = 5,
+  method     = "difference",
+  cov.value1 = "Rural",
+  cov.value2 = "Urban",
+  xlab       = "Change: Urban → Rural",
+  main       = "Topic 5 prevalence: Rural vs. Urban"
+)
+
+#   (d) Difference in Topic 4 between Conservatives and Liberals
+plot(
+  effect_rural_fullcov,
+  covariate  = "partisanship",
+  topics     = 4,
+  method     = "difference",
+  cov.value1 = "Liberal",
+  cov.value2 = "Conservative",
+  xlab       = "Change: Liberal → Conservative",
+  main       = "Topic 4 prevalence by Partisanship"
+)
+
+# 7. Full panel of partisanship differences (all 15 topics)
+op <- par(mfrow = c(3, 5), mar = c(4, 4, 2, 1))
+for (t in 1:15) {
+  plot(
+    effect_rural_fullcov,
+    covariate  = "partisanship",
+    topics     = t,
+    method     = "difference",
+    cov.value1 = "Liberal",
+    cov.value2 = "Conservative",
+    xlab       = "Change: Liberal → Conservative",
+    main       = paste("Topic", t)
+  )
+}
+par(op)
+
+```
+
+
+```{r,fig.width=12}
+# 1. run labelTopics and collapse each row into one string
+lbls <- labelTopics(stm_rural_fullcov_k15, n = 7)
+term_strings <- apply(lbls$prob, 1, paste, collapse = ", ")
+
+# 2. custom topic names, in order 1–15
+topic_labels <- c(
+  "Rural Community Pride",
+  "Rural Isolation",
+  "Political Neglect",
+  "Resource Control",
+  "Agricultural",
+  "Rural Labour",
+  "Self‑Sufficiency",
+  "Stereotyping",
+  "Small‑Town Identity",
+  "Local Concerns",
+  "Population",
+  "Connection to Land",
+  "Consumer Life",
+  "Environmental Concerns",
+  "Social Life"
+)
+
+# 3. build the plotting df
+plot_df <- tibble(
+  topic_num = seq_along(term_strings),
+  gamma     = colMeans(stm_rural_fullcov_k15$theta),
+  terms     = term_strings
+) %>%
+  mutate(
+    label = topic_labels[topic_num],
+    # reorder factor by descending gamma:
+    label = factor(label, levels = label[order(gamma, decreasing = TRUE)])
+  )
+
+# 4. plot with updated title
+ggplot(plot_df, aes(x = gamma, y = label)) +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = terms),
+            hjust   = 0,
+            nudge_x = 0.005,
+            size     = 3) +
+  scale_x_continuous(expand = expansion(c(0, 0.1))) +
+  labs(
+    x     = "γ",
+    y     = NULL,
+    title = "Figure 14. Topic Prevalence and Associated Terms for Perceptions of Ruralites"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.major.y = element_blank(),
+    axis.text.y        = element_text(size = 10)
+  )
+```
+
+
+```{r,fig.width=12}
+plot_df <- tibble(
+  topic_num = seq_along(term_strings),
+  gamma     = colMeans(stm_rural_fullcov_k15$theta),
+  terms     = term_strings
+) %>%
+  mutate(
+    label = topic_labels[topic_num],
+    # reorder factor by descending gamma, then reverse order so largest is top
+    label = factor(label, levels = rev(label[order(gamma, decreasing = TRUE)]))
+  )
+
+ggplot(plot_df, aes(x = gamma, y = label)) +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = terms),
+            hjust   = 0,
+            nudge_x = 0.005,
+            size     = 3) +
+  scale_x_continuous(expand = expansion(c(0, 0.1))) +
+  labs(
+    x     = "γ",
+    y     = NULL,
+    title = "Figure 14. Topic Prevalence and Associated Terms for Perceptions of Ruralites"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.major.y = element_blank(),
+    axis.text.y        = element_text(size = 10)
+  )
+
+```
+
+
+```{r}
+# 8. Plot the continuous effect of political_index on Topic 3
+plot(
+  effect_rural_fullcov,
+  covariate = "political_index",
+  topics    = 1,
+  model     = stm_rural_fullcov_k15,
+  method    = "continuous",
+  xlab      = "Political Index (Higher = More Political Neglect)",
+  main      = "Figure 16 “Political Neglect” Topic and Objective Political Index"
+)
+```
+
+```{r}
+plot(
+  effect_rural_fullcov,
+  covariate = "remoteness_index",
+  topics    = 6,
+  model     = stm_rural_fullcov_k15,
+  method    = "continuous",
+  xlab      = "Political Index (Higher = More Political Neglect)",
+  main      = "Figure 17 “Rural Labour” Topic and Objective Political Index"
+)
+```
+
+
+```{r}
+# set up a 3-row by 5-column plotting grid
+op <- par(mfrow = c(3, 5), mar = c(4, 4, 2, 1))
+
+# loop over topics 1–15
+for (t in 1:15) {
+  plot(
+    effect_rural_fullcov,
+    covariate = "political_index",
+    topics    = t,
+    model     = stm_rural_fullcov_k15,
+    method    = "continuous",
+    xlab      = "Political Index",
+    main      = paste("Topic", t)
+  )
+}
+
+# reset plotting parameters
+par(op)
+```
+
+```{r}
+
+# Custom topic labels
+topic_labels <- c(
+  "Rural Community Pride",
+  "Rural Isolation",
+  "Political Neglect",
+  "Resource Control",
+  "Agricultural",
+  "Rural Labour",
+  "Self‑Sufficiency",
+  "Stereotyping",
+  "Small‑Town Identity",
+  "Local Concerns",
+  "Population",
+  "Connection to Land",
+  "Consumer Life",
+  "Environmental Concerns",
+  "Social Life"
+)
+
+# Create predictions data frame
+predictions <- lapply(1:15, function(t) {
+  preds <- plot(effect_rural_fullcov,
+                covariate = "placetype_best",
+                topics = t,
+                method = "pointestimate",
+                cov.value1 = "Rural",
+                cov.value2 = "Urban",
+                printlegend = FALSE,
+                verbose.labels = FALSE)
+  
+  tibble(
+    topic_num = t,
+    label = topic_labels[t],
+    placetype = c("Rural", "Urban"),
+    estimate = unlist(preds$means),
+    ci.lower = sapply(preds$cis, function(x) x[1]),
+    ci.upper = sapply(preds$cis, function(x) x[2])
+  )
+}) %>% bind_rows()
+
+# Convert to percentages for clarity
+predictions <- predictions %>%
+  mutate(
+    estimate = estimate * 100,
+    ci.lower = ci.lower * 100,
+    ci.upper = ci.upper * 100
+  )
+
+# Check   output
+print(predictions)
+```
+
+
+
+```{r}
+# without a threshold
+thoughts <- findThoughts(
+  model = stm_rural_fullcov_k15,
+  texts = prep_rural_fullcov$meta$text,
+  topics = 1:5,
+  n = 5
+)
+
+# Print again
+for (i in 1:5) {
+  cat("\n--- Examples for Topic", i, "---\n")
+  print(thoughts$docs[[i]])
+}
+```
+
+
+
+```{r}
+
+topic_labels <- c(
+  "Rural Community Pride",
+  "Rural Isolation",
+  "Political Neglect",
+  "Resource Control",
+  "Agricultural",
+  "Rural Labour",
+  "Self‑Sufficiency",
+  "Stereotyping",
+  "Small‑Town Identity",
+  "Local Concerns",
+  "Population",
+  "Connection to Land",
+  "Consumer Life",
+  "Environmental Concerns",
+  "Social Life"
+)
+
+plot_obj <- plot(effect_rural_fullcov,
+                 covariate = "placetype_best",
+                 topics = 1,
+                 method = "pointestimate",
+                 cov.value1 = "Rural",
+                 cov.value2 = "Urban",
+                 printlegend = FALSE,
+                 verbose.labels = FALSE)
+str(plot_obj)
+```
+
+```{r}
+results <- list()
+for (t in 1:15) {
+  cat("\n\n--- Topic", t, "---\n")
+  plot_obj <- plot(effect_rural_fullcov,
+                   covariate = "placetype_best",
+                   topics = t,
+                   method = "pointestimate",
+                   cov.value1 = "Rural",
+                   cov.value2 = "Urban",
+                   printlegend = FALSE,
+                   verbose.labels = FALSE)
+  print(str(plot_obj))          # Show structure for debugging
+  print(plot_obj$means)
+  print(plot_obj$cis)
+}
+```
+
+
+```{r}
+predictions <- lapply(1:15, function(t) {
+  plot_obj <- plot(effect_rural_fullcov,
+                   covariate = "placetype_best",
+                   topics = t,
+                   method = "pointestimate",
+                   cov.value1 = "Rural",
+                   cov.value2 = "Urban",
+                   printlegend = FALSE,
+                   verbose.labels = FALSE)
+  
+  # Get means and cis from the nested structure
+  means <- plot_obj$means[[1]]     # length 2, named "1" and "2"
+  cis   <- plot_obj$cis[[1]]       # 2x2 matrix
+  
+  # According to plot_obj$uvals, index 1 = Urban, 2 = Rural
+  # So means[2] is Rural, means[1] is Urban
+  tibble(
+    topic_num = t,
+    label = topic_labels[t],
+    placetype = c("Rural", "Urban"),
+    estimate = c(means[2], means[1]),
+    ci.lower = c(cis["2.5%", "2"], cis["2.5%", "1"]),
+    ci.upper = c(cis["97.5%", "2"], cis["97.5%", "1"])
+  )
+}) %>% bind_rows()
+
+# Convert to percentage
+predictions <- predictions %>%
+  mutate(
+    estimate = as.numeric(estimate) * 100,
+    ci.lower = as.numeric(ci.lower) * 100,
+    ci.upper = as.numeric(ci.upper) * 100
+  )
+
+# Check the first few lines
+print(predictions)
+
+ggplot(predictions, aes(x = estimate, y = reorder(label, estimate), color = placetype)) +
+  geom_point(position = position_dodge(width = 0.7), size = 2.5) +
+  geom_errorbarh(aes(xmin = ci.lower, xmax = ci.upper), 
+                 position = position_dodge(width = 0.7), height = 0.2) +
+  labs(
+    x = "Predicted Topic Prevalence (%)",
+    y = NULL,
+    color = "Place Type",
+    title = "Figure 18. Predicted Topic Prevalence by Place Type"
+  ) +
+  theme_minimal()
+
+```
+
+
+## Urban STM 
+
+- DV: urban opinions
+- Respondents: urban, rural
+- Control variables: partisanship, placetype, unified_resentment, political_index, economic_index, cultural_index,  
+    remoteness_index, partisan_affective_polarization  
+    
+```{r}
+# --- STM ON URBAN OPEN‐ENDED RESPONSES WITH ALL COVARIATES ---
+#
+# DV: placetype_open_urban (“urban opinions”)
+# Respondents: only those in Urban or Rural (exclude Suburban)
+# Controls:
+#   • partisanship                    (categorical)
+#   • placetype_best                  (Urban vs. Rural)
+#   • unified_resentment              (numeric)
+#   • political_index                 (numeric)
+#   • economic_index                  (numeric)
+#   • cultural_index                  (numeric)
+#   • remoteness_index                (numeric)
+#   • partisan_affective_polarization (numeric)
+
+# 1. Build a data frame of urban open‐ended responses, ensuring all covariates present
+urban_fullcov_df <- dat %>%
+  filter(placetype_best %in% c("Urban", "Rural")) %>%
+  mutate(
+    # Convert to UTF‐8 (drop malformed bytes) and trim whitespace
+    clean_urban = iconv(placetype_open_urban, from = "", to = "UTF-8", sub = ""),
+    clean_urban = str_trim(clean_urban)
+  ) %>%
+  filter(
+    # Keep only non‐blank text and non‐missing covariates
+    !is.na(clean_urban),
+    clean_urban != "",
+    !is.na(partisanship),
+    !is.na(unified_resentment),
+    !is.na(political_index),
+    !is.na(economic_index),
+    !is.na(cultural_index),
+    !is.na(remoteness_index),
+    !is.na(partisan_affective_polarization)
+  ) %>%
+  mutate(
+    doc_id = row_number(),
+    text   = clean_urban
+  ) %>%
+  select(
+    doc_id,
+    text,
+    partisanship,
+    placetype_best,
+    unified_resentment,
+    political_index,
+    economic_index,
+    cultural_index,
+    remoteness_index,
+    partisan_affective_polarization
+  )
+
+# 2. Preprocess text with STM’s pipeline
+proc_urban_fullcov <- textProcessor(
+  documents = urban_fullcov_df$text,
+  metadata  = urban_fullcov_df
+)
+
+prep_urban_fullcov <- prepDocuments(
+  documents    = proc_urban_fullcov$documents,
+  vocab        = proc_urban_fullcov$vocab,
+  meta         = proc_urban_fullcov$meta,
+  lower.thresh = 1
+)
+
+# 3. Fit an STM with prevalence ~ partisanship + placetype_best +
+#    unified_resentment + political_index + economic_index + cultural_index +
+#    remoteness_index + partisan_affective_polarization
+stm_urban_fullcov_k15 <- stm(
+  documents  = prep_urban_fullcov$documents,
+  vocab      = prep_urban_fullcov$vocab,
+  K          = 15,
+  prevalence = ~ partisanship + placetype_best +
+                 unified_resentment + political_index +
+                 economic_index + cultural_index + remoteness_index +
+                 partisan_affective_polarization,
+  data       = prep_urban_fullcov$meta,
+  verbose    = TRUE
+)
+
+# 4. Inspect topic labels and summary
+labelTopics(stm_urban_fullcov_k15, n = 7)
+summary(stm_urban_fullcov_k15)
+plot(stm_urban_fullcov_k15, type = "summary", n = 10)
+
+# 5. Estimate covariate effects for all topics
+effect_urban_fullcov <- estimateEffect(
+  1:15 ~ partisanship + placetype_best +
+         unified_resentment + political_index +
+         economic_index + cultural_index + remoteness_index +
+         partisan_affective_polarization,
+  stmobj    = stm_urban_fullcov_k15,
+  metadata  = prep_urban_fullcov$meta,
+  uncertainty = "Global"
+)
+
+# 6. plots:
+
+#   (a) Continuous effect of partisan_affective_polarization on Topic 8
+plot(
+  effect_urban_fullcov,
+  covariate = "partisan_affective_polarization",
+  topics    = 8,
+  model     = stm_urban_fullcov_k15,
+  method    = "continuous",
+  xlab      = "Partisan Affective Polarization",
+  main      = "Topic 8 prevalence by Partisan Polarization"
+)
+
+#   (b) Continuous effect of remoteness_index on Topic 6
+plot(
+  effect_urban_fullcov,
+  covariate = "remoteness_index",
+  topics    = 6,
+  model     = stm_urban_fullcov_k15,
+  method    = "continuous",
+  xlab      = "Remoteness Index",
+  main      = "Topic 6 prevalence by Remoteness Index"
+)
+
+#   (c) Difference in Topic 5 prevalence: Rural vs. Urban
+plot(
+  effect_urban_fullcov,
+  covariate  = "placetype_best",
+  topics     = 5,
+  method     = "difference",
+  cov.value1 = "Rural",
+  cov.value2 = "Urban",
+  xlab       = "Change: Urban → Rural",
+  main       = "Topic 5 prevalence: Rural vs. Urban"
+)
+
+#   (d) Difference in Topic 4 between Conservatives and Liberals
+plot(
+  effect_urban_fullcov,
+  covariate  = "partisanship",
+  topics     = 4,
+  method     = "difference",
+  cov.value1 = "Liberal",
+  cov.value2 = "Conservative",
+  xlab       = "Change: Liberal → Conservative",
+  main       = "Topic 4 prevalence by Partisanship"
+)
+
+# 7. Full panel of partisanship differences (all 15 topics)
+op <- par(mfrow = c(3, 5), mar = c(4, 4, 2, 1))
+for (t in 1:15) {
+  plot(
+    effect_urban_fullcov,
+    covariate  = "partisanship",
+    topics     = t,
+    method     = "difference",
+    cov.value1 = "Liberal",
+    cov.value2 = "Conservative",
+    xlab       = "Change: Liberal → Conservative",
+    main       = paste("Topic", t)
+  )
+}
+par(op)
+
+```
+  
+  
+```{r, fig.width=16}
+# 1. pull out top‑7 words per topic
+lbls_urb <- labelTopics(stm_urban_fullcov_k15, n = 7)
+term_strings_urb <- apply(lbls_urb$prob, 1, paste, collapse = ", ")
+
+# 2. custom urban topic labels
+topic_labels_urb <- c(
+  "Urban Density",
+  "Commuter Life",
+  "Urban Political Access",
+  "Diversity and Tension",
+  "City Growth",
+  "Individualism",
+  "Time Pressures",
+  "Disconnection",
+  "Urban Crowding",
+  "Cost of Living",
+  "Political Mistrust",
+  "Traffic and Infrastructure",
+  "Transit and Ammenities",
+  "Change and Immigration",
+  "Daily Life"
+)
+
+# 3. build data.frame of γ + labels + terms
+plot_df_urb <- tibble(
+  topic_num = seq_along(term_strings_urb),
+  gamma     = colMeans(stm_urban_fullcov_k15$theta),
+  terms     = term_strings_urb
+) %>%
+  mutate(
+    label = topic_labels_urb[topic_num],
+    label = factor(label, levels = label[order(gamma, decreasing = TRUE)])
+  )
+
+# 4. plot
+ggplot(plot_df_urb, aes(x = gamma, y = label)) +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = terms),
+            hjust   = 0,
+            nudge_x = 0.005,
+            size     = 3) +
+  scale_x_continuous(expand = expansion(c(0, 0.1))) +
+  labs(
+    x     = "γ",
+    y     = NULL,
+    title = "Figure 15. Topic Prevalence and Associated Terms for Perceptions of Urbanites"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.major.y = element_blank(),
+    axis.text.y        = element_text(size = 10)
+  )
+```
+  
+```{r, fig.width=16}
+plot_df_urb <- tibble(
+  topic_num = seq_along(term_strings_urb),
+  gamma     = colMeans(stm_urban_fullcov_k15$theta),
+  terms     = term_strings_urb
+) %>%
+  mutate(
+    label = topic_labels_urb[topic_num],
+    # reverse order so largest γ is at the top
+    label = factor(label, levels = rev(label[order(gamma, decreasing = TRUE)]))
+  )
+
+ggplot(plot_df_urb, aes(x = gamma, y = label)) +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = terms),
+            hjust   = 0,
+            nudge_x = 0.005,
+            size     = 3) +
+  scale_x_continuous(expand = expansion(c(0, 0.1))) +
+  labs(
+    x     = "γ",
+    y     = NULL,
+    title = "Figure 15. Topic Prevalence and Associated Terms for Perceptions of Urbanites"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.major.y = element_blank(),
+    axis.text.y        = element_text(size = 10)
+  )
+
+```
+  
+  
+```{r}
+thoughts <- findThoughts(
+  model = stm_urban_fullcov_k15,
+  texts = prep_urban_fullcov$meta$text,
+  topics = 1:5,
+  n = 5
+)
+
+# Print again
+for (i in 1:5) {
+  cat("\n--- Examples for Topic", i, "---\n")
+  print(thoughts$docs[[i]])
+}
+```
+
+`
+
+```{r}
+# 1. Run findThoughts for Topic 10 (The "Woke Trudeau Topic")
+top_topic10 <- findThoughts(
+  stm_urban_fullcov2_k15,
+  texts  = prep_urban_fullcov2$meta$text, 
+  topics = 10,
+  n      = 5
+)
+
+# 2. Inspect the returned lists using [[1]] instead of $`10`
+#    (since there is only one element in each list)
+top_topic10$thoughts[[1]]  # the five raw response strings
+top_topic10$docs[[1]]      # their document indices (in prep_urban_fullcov2$meta)
+top_topic10$scores[[1]]    # the Topic 10 proportions for those docs
+
+```
+
+```{r}
+# Re-running model diagnostics to confirm 15 topics is still ideal with the french translated to english now
+
+#–– 2) Extract and tokenize English text for the urban prompt
+urban_text <- dat %>%
+  filter(!is.na(placetype_open_urban), str_trim(placetype_open_urban) != "") %>%
+  mutate(doc_id = row_number(),
+         text   = placetype_open_urban)
+
+data("stop_words")  # tidytext’s English list
+urban_tokens <- urban_text %>%
+  unnest_tokens(word, text) %>%
+  anti_join(stop_words, by = "word") %>%
+  filter(!str_detect(word, "\\d+"))
+
+#–– 3) Build the document–term matrix
+urban_sparse <- urban_tokens %>%
+  count(doc_id, word) %>%
+  cast_sparse(doc_id, word, n)
+
+#–– 4) Fit STMs over a range of K
+plan(multisession)
+K_grid <- c(5, 10, 15, 20, 25)
+urban_models <- tibble(K = K_grid) %>%
+  mutate(model = future_map(K, ~ stm(
+    documents = urban_sparse,
+    K         = .x,
+    verbose   = FALSE
+  )))
+
+#–– 5) Create a held-out set
+heldout_urban <- make.heldout(urban_sparse)
+
+#–– 6) Extract diagnostics for each K
+urban_results <- urban_models %>%
+  mutate(
+    exclusivity        = map(model, exclusivity),
+    semantic_coherence = map(model, semanticCoherence, urban_sparse),
+    heldout            = map_dbl(model, ~ eval.heldout(.x, heldout_urban$missing)$expected.heldout),
+    residuals          = map_dbl(model, ~ checkResiduals(.x, urban_sparse)$dispersion),
+    bound              = map_dbl(model, ~ max(.x$convergence$bound))
+  )
+
+diagnostic_df <- urban_results %>%
+  transmute(
+    K,
+    `Semantic coherence`  = map_dbl(semantic_coherence, mean),
+    `Exclusivity`         = map_dbl(exclusivity,        mean),
+    `Held-out likelihood` = heldout,
+    `Residuals`           = residuals,
+    `Lower bound`         = bound
+  ) %>%
+  pivot_longer(-K, names_to = "Metric", values_to = "Value")
+
+#–– 7) Plot diagnostics across K
+ggplot(diagnostic_df, aes(x = K, y = Value, color = Metric)) +
+  geom_line(size = 1.2) +
+  facet_wrap(~ Metric, scales = "free_y") +
+  labs(
+    title = "STM Diagnostics Across K (Urban subset)",
+    x     = "Number of Topics (K)",
+    y     = NULL
+  ) +
+  theme_minimal()
+
+#–– 8) Plot Semantic Coherence vs. Exclusivity
+scatter_df <- urban_results %>%
+  transmute(
+    K,
+    coh = map_dbl(semantic_coherence, ~ mean(.x)),
+    ex  = map_dbl(exclusivity,        ~ mean(.x))
+  )
+
+ggplot(scatter_df, aes(x = coh, y = ex, color = factor(K))) +
+  geom_point(size = 3, alpha = 0.7) +
+  labs(
+    title = "Semantic Coherence vs Exclusivity (Urban subset)",
+    x     = "Mean Semantic Coherence",
+    y     = "Mean Exclusivity",
+    color = "K"
+  ) +
+  theme_minimal()
+
+```
+
+
+
+```{r}
+#–– Load packages
+library(tidyverse)
+library(tidytext)
+library(Matrix)
+library(furrr)
+library(stm)
+
+#–– 1) Force UTF-8 on rural text, then filter and tokenize
+rural_text <- dat %>%
+  # convert any invalid bytes to UTF-8, dropping unconvertible bytes
+  mutate(placetype_open_rural = iconv(placetype_open_rural, to = "UTF-8", sub = "")) %>%
+  filter(
+    !is.na(placetype_open_rural),
+    str_trim(placetype_open_rural) != ""
+  ) %>%
+  mutate(
+    doc_id = row_number(),
+    text   = placetype_open_rural
+  )
+
+data("stop_words")  # tidytext’s English list
+rural_tokens <- rural_text %>%
+  unnest_tokens(word, text) %>%
+  anti_join(stop_words, by = "word") %>%
+  filter(!str_detect(word, "\\d+"))
+
+#–– 2) Build the document–term matrix
+rural_sparse <- rural_tokens %>%
+  count(doc_id, word) %>%
+  cast_sparse(doc_id, word, n)
+
+#–– 3) Fit STMs over a range of K
+plan(multisession)
+K_grid <- c(5, 10, 15, 20, 25)
+rural_models <- tibble(K = K_grid) %>%
+  mutate(model = future_map(K, ~ stm(
+    documents = rural_sparse,
+    K         = .x,
+    verbose   = FALSE
+  )))
+
+#–– 4) Create a held-out set
+heldout_rural <- make.heldout(rural_sparse)
+
+#–– 5) Extract diagnostics for each K
+rural_results <- rural_models %>%
+  mutate(
+    exclusivity        = map(model, exclusivity),
+    semantic_coherence = map(model, semanticCoherence, rural_sparse),
+    heldout            = map_dbl(model, ~ eval.heldout(.x, heldout_rural$missing)$expected.heldout),
+    residuals          = map_dbl(model, ~ checkResiduals(.x, rural_sparse)$dispersion),
+    bound              = map_dbl(model, ~ max(.x$convergence$bound))
+  )
+
+diagnostic_df_rural <- rural_results %>%
+  transmute(
+    K,
+    `Semantic coherence`  = map_dbl(semantic_coherence, mean),
+    `Exclusivity`         = map_dbl(exclusivity,        mean),
+    `Held-out likelihood` = heldout,
+    `Residuals`           = residuals,
+    `Lower bound`         = bound
+  ) %>%
+  pivot_longer(-K, names_to = "Metric", values_to = "Value")
+
+#–– 6) Plot diagnostics across K
+ggplot(diagnostic_df_rural, aes(x = K, y = Value, color = Metric)) +
+  geom_line(size = 1.2) +
+  facet_wrap(~ Metric, scales = "free_y") +
+  labs(
+    title = "STM Diagnostics Across K (Rural subset)",
+    x     = "Number of Topics (K)",
+    y     = NULL
+  ) +
+  theme_minimal()
+
+#–– 7) Plot Semantic Coherence vs. Exclusivity
+scatter_rural <- rural_results %>%
+  transmute(
+    K,
+    coh = map_dbl(semantic_coherence, ~ mean(.x)),
+    ex  = map_dbl(exclusivity,        ~ mean(.x))
+  )
+
+ggplot(scatter_rural, aes(x = coh, y = ex, color = factor(K))) +
+  geom_point(size = 3, alpha = 0.7) +
+  labs(
+    title = "Semantic Coherence vs Exclusivity (Rural subset)",
+    x     = "Mean Semantic Coherence",
+    y     = "Mean Exclusivity",
+    color = "K"
+  ) +
+  theme_minimal()
+
+```
+
