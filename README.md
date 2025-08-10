@@ -1,0 +1,2 @@
+# Material_Origins_of_Place_Based_Affective_Polarization_Replication_Code
+Replication Code for Bradley Wood-MacLean's MA Thesis
